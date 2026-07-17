@@ -3,7 +3,7 @@ import json
 from nemo.collections.asr.models import SortformerEncLabelModel
 
 
-audio_path = Path(r"C:\Users\somlab\Downloads\audio1365983309.16k.wav")
+audio_path = Path(r"C:\Users\Somlab\Downloads\audio1365983309_trunc.16k.wav")
 
 # Dump a config
 manifest_path = audio_path.with_suffix(".json")
@@ -25,3 +25,4 @@ for line in prediction[0]:
 
 speakers = sorted({t["speaker"] for t in speaker_turns})
 print(f"{len(speaker_turns)} speaker turns across {len(speakers)} speakers: {speakers}")
+print(speaker_turns)

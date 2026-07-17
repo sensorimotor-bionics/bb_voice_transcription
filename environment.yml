@@ -10,5 +10,5 @@ dependencies:
   - pip:
     - faster_whisper
     - nemo_toolkit[asr]
-    - soundfile
     - pydub
+    - torch
