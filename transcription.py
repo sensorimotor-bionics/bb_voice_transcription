@@ -65,6 +65,7 @@ def create_transcript(segments, speaker_times):
     
     return transcript
 
+
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | None = None,
@@ -73,14 +74,15 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
-    
+    audio_path = Path(audio_path)
+
     # Ensure whisper model is valid
     valid_whisper_models = ["tiny", "base", "small", "medium", "large-v3"]
     assert whisper_size in valid_whisper_models, f"'{whisper_size}' was not found in {valid_whisper_models}"
     
     # Parse the transcription path
     if transcription_path is None:
-        transcription_path = Path(audio_path).stem + "_transcript.txt"
+        transcription_path = audio_path.stem + "_transcript.txt"
     else:
         if not isinstance(transcription_path, (str, bytes, os.PathLike)):
             raise TypeError("transcription_path must be a PathLike")
@@ -122,7 +124,22 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         segment_times[1:,2] = segment_times[1:,1] - segment_times[:-1,0]
 
         # Loop through segments to find gaps and diarize in chunks
+        start_time, stop_time = -1, max_audio_length
+        subsegment_times = []
+        while start_time < segment_times[-1,1]:
+            # Find the indices of the segments in the range of the start and stop time
+            sub_seg_idx = np.where((segment_times[:,0] > start_time and 
+                                    segment_times[:,1] < stop_time and
+                                    segment_times[:,2] > 1))[0]
+            start_idx = sub_seg_idx[0]
+            stop_idx = sub_seg_idx[-1]
+            
+            # Keep track of subsegment for later alignment
+            subsegment_times.append([segment_times[start_idx,0], segment_times[start_idx,1]])
 
+            # Update 
+            start_time = segment_times[stop_idx,1]
+            stop_time = start_time + max_audio_length
     
     else: # Otherwise process the whole file
         diar_prediction = diarize(diar_model, audio_path, audio_duration)
@@ -137,4 +154,13 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                 last = row["speaker"]
             print(f"  ({row['start']:.1f}-{row['end']:.1f}) {row['text']}")
 
-    ### Check speaker embeddings for 
+    # Dump the transcript
+    out_path = audio_path.with_suffix(".transcript.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        last = None
+        for row in transcript:
+            if row["speaker"] != last:
+                f.write(f"\n[{row['speaker']}]\n")
+                last = row["speaker"]
+            f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
+    print("Saved transcript to", out_path)
