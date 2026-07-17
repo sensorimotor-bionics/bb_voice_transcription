@@ -1,0 +1,14 @@
+name: bb_voice_transcription
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - typing
+  - ipykernel
+  - typing_extensions
+  - pip:
+    - faster_whisper
+    - nemo_toolkit[asr]
+    - soundfile
+    - pydub
