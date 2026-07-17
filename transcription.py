@@ -4,11 +4,11 @@ import json
 import torch
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
-from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
 from audio_utils import trim_wav, prepare_audio
 import numpy as np
 
-def process_prediction(prediction):
+def format_diarization(prediction):
     speaker_turns = []
     for line in prediction:
         start, end, speaker = line.split()
@@ -16,11 +16,59 @@ def process_prediction(prediction):
 
     return speaker_turns
 
+
+def diarize(diarizatrion_model: SortformerEncLabelModel, 
+            audio_path: os.PathLike,
+            audio_duration: int):
+
+    # Create the manifest config for the model
+    manifest_path = Path(audio_path).stem + ".json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"audio_filepath": str(audio_path),
+                            "offset": 0,
+                            "duration": audio_duration,
+                            "label": "infer",
+                            "text": "-"}) + "\n")
+    
+    # Run the diarization
+    prediction = diarizatrion_model.diarize(audio=[str(manifest_path)], batch_size=1)
+
+    # Delete the manifest file
+    os.remove(manifest_path)
+
+    # Return the processed prediction
+    return prediction
+
+
+def assign_speaker(segment, speaker_turns):
+    votes = {}
+    # For each word in the segment
+    for w in (segment.words or []):
+        # Check 
+        best, best_overlap = "unknown", 0.0
+        for t in speaker_turns:
+            overlap = max(0.0, min(w.end, t["end"]) - max(w.start, t["start"]))
+            if overlap > best_overlap:
+                best_overlap, best = overlap, t["speaker"]
+
+        votes[best] = votes.get(best, 0.0) + (w.end - w.start)
+    return max(votes, key=votes.get) if votes else best
+
+
+def create_transcript(segments, speaker_times):
+    transcript = []
+    for s in segments:
+        transcript.append({"start": s.start,
+                           "end": s.end,
+                           "speaker": assign_speaker(s, speaker_times),
+                           "text": s.text.strip()})
+    
+    return transcript
+
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | None = None,
                                  max_audio_length: int = 600,
-                                 segment_gap: int | float = 5,
                                  verbose: bool = False):
     
     # Check that the audio path exists
@@ -49,50 +97,44 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         print(f"\tDuration = {audio_duration} seconds")
 
     ### FasterWhisper transcription
+    print("\tInitalizing transcription")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "auto" if device == "cuda" else "int8"
-    print("\tInitalizing transcription")
     model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
     segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
-    segments = list(segments)
-    
-    # Identify gaps in segments
-    segment_times = np.zeros((len(segments), 2))
-    for i, segment in enumerate(segments):
-        segment_times[i,0] = segment.start
-        segment_times[i,1] = segment.end
-        if verbose:
-            print("\t\t[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
+    segments = list(segments) # Full list of word segments for whole file
 
-    ### NeMo diarization & merging
+    ### NeMo diarization
     print("\tInitalizing diarization")
-    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1")
-    diar_model.eval()
-
+    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval()
+    
     # If audio duration exceeds max then chunk
     if audio_duration > max_audio_length:
-        pass
+        # Initalize an encoding model to identify the speaker across segments
+        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval()
+
+        # Identify gaps in segments
+        segment_times = np.zeros((len(segments), 3))
+        for i, segment in enumerate(segments):
+            segment_times[i,0] = segment.start
+            segment_times[i,1] = segment.end
+
+        segment_times[1:,2] = segment_times[1:,1] - segment_times[:-1,0]
+
+        # Loop through segments to find gaps and diarize in chunks
+
     
     else: # Otherwise process the whole file
-        # Create the manifest config for the model
-        manifest_path = audio_path.with_suffix(".json")
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"audio_filepath": str(audio_path),
-                                "offset": 0,
-                                "duration": audio_duration,
-                                "label": "infer",
-                                "text": "-"}) + "\n")
-        
-        # Run the diarization
-        prediction = diar_model.diarize(audio=[str(manifest_path)], batch_size=1)
-        speaker_turns = process_prediction(prediction[0])
+        diar_prediction = diarize(diar_model, audio_path, audio_duration)
+        speaker_times = format_diarization(diar_prediction[0])
+        transcript = create_transcript(segments, speaker_times)
+    
+    if verbose: # Print the transcript
+        last = None
+        for row in transcript:
+            if row["speaker"] != last:
+                print(f"\n[{row['speaker']}]") # Identify the speaker on speaker change
+                last = row["speaker"]
+            print(f"  ({row['start']:.1f}-{row['end']:.1f}) {row['text']}")
 
-    # Sort all turn by speaker
-    speakers = sorted({t["speaker"] for t in speaker_turns})
-    if verbose:
-        print(f"{len(speaker_turns)} speaker turns across {len(speakers)} speakers: {speakers}")
-
-
-    # Check audio file length
-
-    # Merge speaker labels with transcript
+    ### Check speaker embeddings for 
