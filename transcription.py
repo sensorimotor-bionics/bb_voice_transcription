@@ -6,11 +6,21 @@ from faster_whisper import WhisperModel
 from pydub import AudioSegment
 from nemo.collections.asr.models import SortformerEncLabelModel
 from audio_utils import trim_wav, prepare_audio
+import numpy as np
+
+def process_prediction(prediction):
+    speaker_turns = []
+    for line in prediction:
+        start, end, speaker = line.split()
+        speaker_turns.append({"start": float(start), "end": float(end), "speaker": speaker})
+
+    return speaker_turns
 
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | None = None,
-                                 max_audio_length: int = 90,
+                                 max_audio_length: int = 600,
+                                 segment_gap: int | float = 5,
                                  verbose: bool = False):
     
     # Check that the audio path exists
@@ -43,17 +53,46 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     compute_type = "auto" if device == "cuda" else "int8"
     print("\tInitalizing transcription")
     model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
-    segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
     segments = list(segments)
     
-    for segment in segments:
+    # Identify gaps in segments
+    segment_times = np.zeros((len(segments), 2))
+    for i, segment in enumerate(segments):
+        segment_times[i,0] = segment.start
+        segment_times[i,1] = segment.end
         if verbose:
             print("\t\t[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
 
-    # Identify gaps in segments
-
     ### NeMo diarization & merging
-    # Format input file for NeMo (mono 16k)
+    print("\tInitalizing diarization")
+    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1")
+    diar_model.eval()
+
+    # If audio duration exceeds max then chunk
+    if audio_duration > max_audio_length:
+        pass
+    
+    else: # Otherwise process the whole file
+        # Create the manifest config for the model
+        manifest_path = audio_path.with_suffix(".json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"audio_filepath": str(audio_path),
+                                "offset": 0,
+                                "duration": audio_duration,
+                                "label": "infer",
+                                "text": "-"}) + "\n")
+        
+        # Run the diarization
+        prediction = diar_model.diarize(audio=[str(manifest_path)], batch_size=1)
+        speaker_turns = process_prediction(prediction[0])
+
+    # Sort all turn by speaker
+    speakers = sorted({t["speaker"] for t in speaker_turns})
+    if verbose:
+        print(f"{len(speaker_turns)} speaker turns across {len(speakers)} speakers: {speakers}")
+
+
     # Check audio file length
 
     # Merge speaker labels with transcript

@@ -10,6 +10,8 @@ def trim_wav(input_file: PathLike,
     """
     Trims a WAV file to a specified duration using ffmpeg.
     """
+    assert stop_time > start_time, f"Stop time must be greater than start time"
+    
     command = [
         'ffmpeg',
         '-ss', str(start_time),           # Start at the very beginning
@@ -34,7 +36,11 @@ def prepare_audio(input_file: PathLike,
 
     try:
         audio = AudioSegment.from_file(input_file)
-        audio.export(output_file, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+        if not str(input_file).endswith(".16k.wav"):
+            audio.export(output_file,
+                         format="wav",
+                         parameters=["-ac", "1", "-ar", "16000"])
+            
         return len(audio)/1000 # 
     except Exception as e:
         print(f"Error converting {input_file} with FFMPEG: {e}")
