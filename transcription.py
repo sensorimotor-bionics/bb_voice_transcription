@@ -3,10 +3,24 @@ from pathlib import Path
 import json
 import torch
 from faster_whisper import WhisperModel
-from pydub import AudioSegment
-from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
-from audio_utils import trim_wav, prepare_audio
+from nemo.collections.asr.models import SortformerEncLabelModel
+from audio_utils import prepare_audio
 import numpy as np
+
+### Disable logging stuff
+from nemo.utils import logging as nemo_logging
+
+os.environ["NEMO_LOG_LEVEL"] = "40"
+nemo_logging.set_verbosity(nemo_logging.ERROR)
+
+
+def transcribe(audio_path: os.PathLike, whisper_size: str):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "auto" if device == "cuda" else "int8"
+    model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
+    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    
+    return list(segments) # Full list of word segments for whole file
 
 def format_diarization(prediction):
     speaker_turns = []
@@ -19,19 +33,22 @@ def format_diarization(prediction):
 
 def diarize(diarizatrion_model: SortformerEncLabelModel, 
             audio_path: os.PathLike,
+            offset: int,
             audio_duration: int):
 
-    # Create the manifest config for the model
+    # Create the manifest config for the model - had permission issues with the default config
     manifest_path = Path(audio_path).stem + ".json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(json.dumps({"audio_filepath": str(audio_path),
-                            "offset": 0,
+                            "offset": offset,
                             "duration": audio_duration,
                             "label": "infer",
                             "text": "-"}) + "\n")
     
     # Run the diarization
-    prediction = diarizatrion_model.diarize(audio=[str(manifest_path)], batch_size=1)
+    prediction = diarizatrion_model.diarize(audio=[str(manifest_path)],
+                                            batch_size=1,
+                                            verbose=False)
 
     # Delete the manifest file
     os.remove(manifest_path)
@@ -100,21 +117,14 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     ### FasterWhisper transcription
     print("\tInitalizing transcription")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "auto" if device == "cuda" else "int8"
-    model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
-    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
-    segments = list(segments) # Full list of word segments for whole file
-
+    segments = transcribe(audio_path, whisper_size)
+    
     ### NeMo diarization
     print("\tInitalizing diarization")
     diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval()
     
     # If audio duration exceeds max then chunk
     if audio_duration > max_audio_length:
-        # Initalize an encoding model to identify the speaker across segments
-        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval()
-
         # Identify gaps in segments
         segment_times = np.zeros((len(segments), 3))
         for i, segment in enumerate(segments):
@@ -125,36 +135,37 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
         # Loop through segments to find gaps and diarize in chunks
         start_time, stop_time = -1, max_audio_length
-        subsegment_times = []
+        speaker_times = []
+        chunk_counter = 1
         while start_time < segment_times[-1,1]:
+            print(f"\t- Chunk {chunk_counter}")
             # Find the indices of the segments in the range of the start and stop time
-            sub_seg_idx = np.where((segment_times[:,0] > start_time and 
-                                    segment_times[:,1] < stop_time and
-                                    segment_times[:,2] > 1))[0]
+            sub_seg_idx = np.where(((segment_times[:,0] > start_time) & 
+                            (segment_times[:,1] < stop_time) & 
+                            (segment_times[:,2] > 1)))[0]
             start_idx = sub_seg_idx[0]
             stop_idx = sub_seg_idx[-1]
             
-            # Keep track of subsegment for later alignment
-            subsegment_times.append([segment_times[start_idx,0], segment_times[start_idx,1]])
+            # Diarize audio chunk
+            diar_prediction = diarize(diar_model,
+                                      audio_path,
+                                      segment_times[start_idx,0] - 0.1,
+                                      segment_times[stop_idx,1] - segment_times[start_idx,0] + 0.2)
+            speaker_times += format_diarization(diar_prediction[0]) # Append speaker times for the chunk
 
             # Update 
             start_time = segment_times[stop_idx,1]
             stop_time = start_time + max_audio_length
+            chunk_counter += 1
     
     else: # Otherwise process the whole file
-        diar_prediction = diarize(diar_model, audio_path, audio_duration)
+        diar_prediction = diarize(diar_model, audio_path, 0, audio_duration)
         speaker_times = format_diarization(diar_prediction[0])
-        transcript = create_transcript(segments, speaker_times)
-    
-    if verbose: # Print the transcript
-        last = None
-        for row in transcript:
-            if row["speaker"] != last:
-                print(f"\n[{row['speaker']}]") # Identify the speaker on speaker change
-                last = row["speaker"]
-            print(f"  ({row['start']:.1f}-{row['end']:.1f}) {row['text']}")
 
-    # Dump the transcript
+    # Create the transcript from segments and speaker times
+    transcript = create_transcript(segments, speaker_times)
+
+    # Dump the transcript as .txt
     out_path = audio_path.with_suffix(".transcript.txt")
     with open(out_path, "w", encoding="utf-8") as f:
         last = None
@@ -163,4 +174,10 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                 f.write(f"\n[{row['speaker']}]\n")
                 last = row["speaker"]
             f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
-    print("Saved transcript to", out_path)
+
+    # Dump the transcript as .json for later parsing
+    out_path = audio_path.with_suffix(".transcript.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(transcript, indent=4) + "\n")
+
+    print("\tSaved transcript to", out_path)
