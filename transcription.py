@@ -22,6 +22,7 @@ def transcribe(audio_path: os.PathLike, whisper_size: str):
     
     return list(segments) # Full list of word segments for whole file
 
+
 def format_diarization(prediction):
     speaker_turns = []
     for line in prediction:
