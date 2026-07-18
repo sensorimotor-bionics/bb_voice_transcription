@@ -1,11 +1,14 @@
 import os
-from pathlib import Path
 import json
 import torch
-from faster_whisper import WhisperModel
-from nemo.collections.asr.models import SortformerEncLabelModel
-from audio_utils import prepare_audio
+import librosa
 import numpy as np
+from faster_whisper import WhisperModel
+from pathlib import Path
+from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
+from audio_utils import prepare_audio
+from sklearn.cluster import AgglomerativeClustering
+
 
 ### Disable logging stuff
 from nemo.utils import logging as nemo_logging
@@ -23,10 +26,13 @@ def transcribe(audio_path: os.PathLike, whisper_size: str):
     return list(segments) # Full list of word segments for whole file
 
 
-def format_diarization(prediction):
+def format_diarization(prediction, speaker_offset = 0):
     speaker_turns = []
     for line in prediction:
         start, end, speaker = line.split()
+        if speaker_offset > 0:
+            spk_int = int(speaker[-1])
+            speaker = f"speaker_{spk_int+speaker_offset}"
         speaker_turns.append({"start": float(start), "end": float(end), "speaker": speaker})
 
     return speaker_turns
@@ -113,6 +119,8 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     ### Pre-format audio file for quicker processing
     audio_duration = prepare_audio(audio_path)
+    chunked_diarization = audio_duration > max_audio_length # Bool for whether we chunk or not
+
     if verbose:
         print(f"\tDuration = {audio_duration} seconds")
 
@@ -125,7 +133,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval()
     
     # If audio duration exceeds max then chunk
-    if audio_duration > max_audio_length:
+    if chunked_diarization:
         # Identify gaps in segments
         segment_times = np.zeros((len(segments), 3))
         for i, segment in enumerate(segments):
@@ -152,12 +160,12 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                       audio_path,
                                       segment_times[start_idx,0] - 0.1,
                                       segment_times[stop_idx,1] - segment_times[start_idx,0] + 0.2)
-            speaker_times += format_diarization(diar_prediction[0]) # Append speaker times for the chunk
+            speaker_times += format_diarization(diar_prediction[0], chunk_counter*10) # Append speaker times for the chunk
 
             # Update 
             start_time = segment_times[stop_idx,1]
             stop_time = start_time + max_audio_length
-            chunk_counter += 1
+            chunk_counter += 1        
     
     else: # Otherwise process the whole file
         diar_prediction = diarize(diar_model, audio_path, 0, audio_duration)
@@ -165,6 +173,64 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     # Create the transcript from segments and speaker times
     transcript = create_transcript(segments, speaker_times)
+
+    # Harmonize diarization across chunks
+    if chunked_diarization:
+        # Get segments split by predicted speaker
+        speaker = transcript[0]['speaker']
+        num_segments = len(transcript)
+        speaker_start_times, speaker_stop_times, speakers = [0], [], [speaker]
+        for i, t in enumerate(transcript):
+            if t['speaker'] != speaker:
+                speaker_start_times.append(t['start'])
+                if i == 0 or i == num_segments:
+                    speaker_stop_times.append(t['end'])
+                else:
+                    speaker_stop_times.append(transcript[i-1]['end'])
+                speaker = t['speaker']
+                speakers.append(speaker)
+
+        # Add the final timestamp
+        speaker_stop_times.append(transcript[-1]['end'])
+
+        # Get an encoding model for feature extraction
+        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval()
+        device = next(enc_model.parameters()).device
+        # load the whole audio file
+        sample_frequency = 16000
+        audio, _ = librosa.load(audio_path, sr=sample_frequency)
+
+        # Manually compute embeddings
+        embeddings = []
+        for (start, stop) in zip(speaker_start_times, speaker_stop_times):
+            # Get segment indices for audio file
+            start_idx = int(start * sample_frequency)
+            stop_idx = int(stop * sample_frequency)
+            audio_tensor = torch.tensor(audio[start_idx:stop_idx], dtype=torch.float32).unsqueeze(0).to(device)
+            audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.int32).to(device)
+
+            # Get the embedding from the encoding model
+            with torch.no_grad():
+                _, embedding = enc_model.forward(input_signal=audio_tensor, input_signal_length=audio_len)
+
+            # Normalize and return to CPU
+            embedding = embedding.squeeze(0).cpu().numpy()
+            embeddings.append(embedding / np.linalg.norm(embedding))
+
+        # Compute similarity between each pair of embeddings
+        similarity_mat = np.zeros((len(embeddings), len(embeddings)))
+        for i in range(len(embeddings)):
+            for j in range(len(embeddings)):
+                similarity_mat[i,j] = np.dot(embeddings[i], embeddings[j]) / ((np.dot(embeddings[i], embeddings[i]) * np.dot(embeddings[j], embeddings[j])) ** 0.5)
+        
+        # Convert to distance matrix for precomputed clustering
+        distance_mat = 1-similarity_mat
+
+        # Cluster to get harmonized speaker labels
+        feature_clusterer = AgglomerativeClustering(n_clusters=None, metric='precomputed', linkage='average', distance_threshold=0.75)
+        feature_labels = feature_clusterer.fit_predict(distance_mat)
+
+        # Update the transcript
 
     # Dump the transcript as .txt
     out_path = audio_path.with_suffix(".transcript.txt")
