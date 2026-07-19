@@ -30,6 +30,9 @@ def trim_wav(input_file: PathLike,
 
 def prepare_audio(input_file: PathLike,
                   output_file: PathLike | None = None) -> float:
+    """
+    Uses ffmpeg to ensure the file is .wav format and sampled at 16kHz.
+    """
     # Simple rename
     if output_file is None:
         output_file = Path(input_file).with_suffix(".16k.wav")

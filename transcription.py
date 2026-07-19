@@ -96,18 +96,7 @@ def export_transcript_by_speaker(transcript:list, out_path:os.PathLike):
                 f.write(f"\n[{row['speaker']}]\n")
                 last = row["speaker"]
             f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
-
-
-def relabel_transcript(transcript_path:os.PathLike, speaker_ids:list[str]):
-    with open(transcript_path, 'r', encoding='utf8') as f: 
-        transcript = json.load(f)
-
-    # Get list of unique speakers and confirm lengths match
-    speaker_id = [t['speaker'].split('_')[-1] for t in transcript]
-    speaker_list = list(set(speaker_id))
-    assert len(speaker_list) == len(speaker_ids), f"{len(speaker_list)} speakers in transcript but only {len(speaker_ids)} provided"
-
-    # Iterate through the transcript and relabel according to speaker id
+            
 
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
@@ -252,16 +241,10 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         elif isinstance(num_speakers, int):
             feature_clusterer = AgglomerativeClustering(n_clusters=2, metric='precomputed', linkage='average')
         feature_labels = feature_clusterer.fit_predict(distance_mat)
-        print(np.unique(feature_labels))
-
-        export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript_raw.txt"))
 
         # Update the transcript
-        speaker_map = {name: f"speaker_{feature_labels[idx]}" for idx, name in enumerate(speakers)}
         for t in transcript:
-            t['speaker'] = speaker_map[t['speaker']]
-
-        export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript_relabeled.txt"))
+            t['speaker'] = f"speaker_{feature_labels[speakers.index(t['speaker'])]}"
 
     # Dump the transcript as .txt
     export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript.txt"))
