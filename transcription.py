@@ -9,10 +9,8 @@ from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLa
 from audio_utils import prepare_audio
 from sklearn.cluster import AgglomerativeClustering
 
-
-### Disable logging stuff
+## Disable logging stuff
 from nemo.utils import logging as nemo_logging
-
 os.environ["NEMO_LOG_LEVEL"] = "40"
 nemo_logging.set_verbosity(nemo_logging.ERROR)
 
@@ -90,11 +88,33 @@ def create_transcript(segments, speaker_times):
     return transcript
 
 
+def export_transcript_by_speaker(transcript:list, out_path:os.PathLike):
+    with open(out_path, "w", encoding="utf-8") as f:
+        last = None
+        for row in transcript:
+            if row["speaker"] != last:
+                f.write(f"\n[{row['speaker']}]\n")
+                last = row["speaker"]
+            f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
+
+
+def relabel_transcript(transcript_path:os.PathLike, speaker_ids:list[str]):
+    with open(transcript_path, 'r', encoding='utf8') as f: 
+        transcript = json.load(f)
+
+    # Get list of unique speakers and confirm lengths match
+    speaker_id = [t['speaker'].split('_')[-1] for t in transcript]
+    speaker_list = list(set(speaker_id))
+    assert len(speaker_list) == len(speaker_ids), f"{len(speaker_list)} speakers in transcript but only {len(speaker_ids)} provided"
+
+    # Iterate through the transcript and relabel according to speaker id
+
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | None = None,
                                  max_audio_length: int = 600,
-                                 verbose: bool = False):
+                                 verbose: bool = False,
+                                 num_speakers: int | None = 2):
     
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
@@ -223,24 +243,28 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
             for j in range(len(embeddings)):
                 similarity_mat[i,j] = np.dot(embeddings[i], embeddings[j]) / ((np.dot(embeddings[i], embeddings[i]) * np.dot(embeddings[j], embeddings[j])) ** 0.5)
         
-        # Convert to distance matrix for precomputed clustering
+        # Convert to distance matrix for linkage assessement
         distance_mat = 1-similarity_mat
 
         # Cluster to get harmonized speaker labels
-        feature_clusterer = AgglomerativeClustering(n_clusters=None, metric='precomputed', linkage='average', distance_threshold=0.75)
+        if num_speakers is None:
+            feature_clusterer = AgglomerativeClustering(n_clusters=None, metric='precomputed', linkage='average', distance_threshold=0.75)
+        elif isinstance(num_speakers, int):
+            feature_clusterer = AgglomerativeClustering(n_clusters=2, metric='precomputed', linkage='average')
         feature_labels = feature_clusterer.fit_predict(distance_mat)
+        print(np.unique(feature_labels))
+
+        export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript_raw.txt"))
 
         # Update the transcript
+        speaker_map = {name: f"speaker_{feature_labels[idx]}" for idx, name in enumerate(speakers)}
+        for t in transcript:
+            t['speaker'] = speaker_map[t['speaker']]
+
+        export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript_relabeled.txt"))
 
     # Dump the transcript as .txt
-    out_path = audio_path.with_suffix(".transcript.txt")
-    with open(out_path, "w", encoding="utf-8") as f:
-        last = None
-        for row in transcript:
-            if row["speaker"] != last:
-                f.write(f"\n[{row['speaker']}]\n")
-                last = row["speaker"]
-            f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
+    export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript.txt"))
 
     # Dump the transcript as .json for later parsing
     out_path = audio_path.with_suffix(".transcript.json")

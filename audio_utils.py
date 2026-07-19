@@ -23,7 +23,7 @@ def trim_wav(input_file: PathLike,
     
     try:
         subprocess.run(command, check=True)
-        print(f"Successfully trimmed {input_file} to {output_file}.")
+        print(f"Successfully trimmed {input_file} to {output_file} with range {start_time}-{stop_time}.")
     except subprocess.CalledProcessError as e:
         print(f"Error trimming audio: {e}")
 
@@ -41,6 +41,6 @@ def prepare_audio(input_file: PathLike,
                          format="wav",
                          parameters=["-ac", "1", "-ar", "16000"])
             
-        return len(audio)/1000 # 
+        return len(audio) / 1000 # Duration of audio file in seconds
     except Exception as e:
         print(f"Error converting {input_file} with FFMPEG: {e}")
