@@ -8,6 +8,7 @@ from pathlib import Path
 from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
 from audio_utils import prepare_audio
 from sklearn.cluster import AgglomerativeClustering
+from post_processing import export_transcript_by_speaker
 
 ## Disable logging stuff
 from nemo.utils import logging as nemo_logging
@@ -88,26 +89,18 @@ def create_transcript(segments, speaker_times):
     return transcript
 
 
-def export_transcript_by_speaker(transcript:list, out_path:os.PathLike):
-    with open(out_path, "w", encoding="utf-8") as f:
-        last = None
-        for row in transcript:
-            if row["speaker"] != last:
-                f.write(f"\n[{row['speaker']}]\n")
-                last = row["speaker"]
-            f.write(f"({row['start']:.1f}-{row['end']:.1f}) {row['text']}\n")
-            
-
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | None = None,
                                  max_audio_length: int = 600,
                                  verbose: bool = False,
-                                 num_speakers: int | None = 2):
+                                 num_speakers: int | None = 2,
+                                 cleanup: bool = True):
     
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
     audio_path = Path(audio_path)
+    audio_path_bk = audio_path
 
     # Ensure whisper model is valid
     valid_whisper_models = ["tiny", "base", "small", "medium", "large-v3"]
@@ -128,6 +121,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     ### Pre-format audio file for quicker processing
     audio_duration = prepare_audio(audio_path)
+    audio_path = audio_path.with_suffix(".16k.wav")
     chunked_diarization = audio_duration > max_audio_length # Bool for whether we chunk or not
 
     if verbose:
@@ -156,7 +150,8 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         speaker_times = []
         chunk_counter = 1
         while start_time < segment_times[-1,1]:
-            print(f"\t- Chunk {chunk_counter}")
+            if verbose:
+                print(f"\t- Chunk {chunk_counter}")
             # Find the indices of the segments in the range of the start and stop time
             sub_seg_idx = np.where(((segment_times[:,0] > start_time) & 
                             (segment_times[:,1] < stop_time) & 
@@ -255,3 +250,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         f.write(json.dumps(transcript, indent=4) + "\n")
 
     print("\tSaved transcript to", out_path)
+
+    if cleanup:
+        if (os.path.exists(audio_path) and audio_path.suffix == ".16k.wav" and audio_path_bk != audio_path):
+            os.remove(audio_path)

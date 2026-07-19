@@ -31,4 +31,4 @@ def relabel_transcript(transcript_path:os.PathLike, speaker_ids:list[str]):
         t['speaker'] = speaker_ids[idx]
 
     # Dump relabeled transcript
-    export_transcript_by_speaker(transcript, transcript_path.with_suffiix(".relabeled.txt"))
+    export_transcript_by_speaker(transcript, transcript_path.with_suffix(".relabeled.txt"))
