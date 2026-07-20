@@ -10,22 +10,40 @@ from audio_utils import prepare_audio
 from sklearn.cluster import AgglomerativeClustering
 from post_processing import export_transcript_by_speaker
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from faster_whisper.transcribe import Segment
+
 ## Disable logging stuff
 from nemo.utils import logging as nemo_logging
 os.environ["NEMO_LOG_LEVEL"] = "40"
 nemo_logging.set_verbosity(nemo_logging.ERROR)
 
 
-def transcribe(audio_path: os.PathLike, whisper_size: str):
+def transcribe(audio_path: os.PathLike, whisper_size: str) -> list[Segment]:
+    """
+    Wrapper for using WhisperModel to transcribe an audio file.
+
+    Args:
+        audio_path (os.PathLike): Path to file.
+        whisper_size (str): WhisperModel size ["tiny", "small", "large-v3", etc]
+
+    Returns:
+        list[Segment]: List of word segments
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "auto" if device == "cuda" else "int8"
     model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
-    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    segments, _ = model.transcribe(str(audio_path), beam_size=5, word_timestamps=True)
     
     return list(segments) # Full list of word segments for whole file
 
 
-def format_diarization(prediction, speaker_offset = 0):
+def format_diarization(prediction: list[str],
+                       speaker_offset: int = 0) -> list[dict]:
+    """
+    Convert diarization output into easier to process dictionary
+    """
     speaker_turns = []
     for line in prediction:
         start, end, speaker = line.split()
@@ -39,8 +57,20 @@ def format_diarization(prediction, speaker_offset = 0):
 
 def diarize(diarizatrion_model: SortformerEncLabelModel, 
             audio_path: os.PathLike,
-            offset: int,
-            audio_duration: int):
+            offset: int | float,
+            audio_duration: int | float) -> list[list[str]]:
+    """
+    Wrapper function for diarize an audio file. Handles dynamic manifests.
+
+    Args:
+        diarizatrion_model (SortformerEncLabelModel): Which model to use for diarization.
+        audio_path (os.PathLike): Path to audio file.
+        offset (int | float): Where in audio file to start diarization.
+        audio_duration (int | float): What duration of the audio file to process.
+
+    Returns:
+        list[list[str]]: Speaker timings
+    """
 
     # Create the manifest config for the model - had permission issues with the default config
     manifest_path = Path(audio_path).stem + ".json"
@@ -60,13 +90,17 @@ def diarize(diarizatrion_model: SortformerEncLabelModel,
     os.remove(manifest_path)
 
     # Return the processed prediction
-    return prediction
+    return prediction # type: ignore
 
 
-def assign_speaker(segment, speaker_turns):
+def assign_speaker(segment: Segment,
+                   speaker_turns: list[dict]) -> str:
+    """
+    Assign speaker to word segment based on maximum overlap from diarization output.
+    """
     votes = {}
     # For each word in the segment
-    for w in (segment.words or []):
+    for w in (segment.words or []): # type: ignore
         # Check 
         best, best_overlap = "unknown", 0.0
         for t in speaker_turns:
@@ -75,10 +109,14 @@ def assign_speaker(segment, speaker_turns):
                 best_overlap, best = overlap, t["speaker"]
 
         votes[best] = votes.get(best, 0.0) + (w.end - w.start)
-    return max(votes, key=votes.get) if votes else best
+    return max(votes, key=votes.get) if votes else best # type: ignore
 
 
-def create_transcript(segments, speaker_times):
+def create_transcript(segments: list[Segment],
+                      speaker_times: list[dict]) -> list[dict]:
+    """
+    Create a transcript by assigning speaker times to word segments.
+    """
     transcript = []
     for s in segments:
         transcript.append({"start": s.start,
@@ -96,7 +134,18 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
                                  cleanup: bool = True):
-    
+    """
+    High level function to process, transcribe, and diarize a single audio file.
+
+    Args:
+        audio_path (os.PathLike): Path to the file to be processed.
+        whisper_size (str, optional): Which whisper model to use. Defaults to "small".
+        transcription_path (str | None, optional): Output path for the resulting transcript. Defaults to None.
+        max_audio_length (int, optional): Maximum duration of audio file to used before using a chunked approach. Defaults to 600.
+        verbose (bool, optional): Extra print statements. Defaults to False.
+        num_speakers (int | None, optional): How many speakers are present for the classification. Defaults to 2.
+        cleanup (bool, optional): Automatically delete intermediary files. Defaults to True.
+    """
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
     audio_path = Path(audio_path)
@@ -133,7 +182,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     
     ### NeMo diarization
     print("\tInitalizing diarization")
-    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval()
+    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval() # type: ignore
     
     # If audio duration exceeds max then chunk
     if chunked_diarization:
@@ -198,7 +247,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         speaker_stop_times.append(transcript[-1]['end'])
 
         # Get an encoding model for feature extraction
-        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval()
+        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
         device = next(enc_model.parameters()).device
         # load the whole audio file
         sample_frequency = 16000

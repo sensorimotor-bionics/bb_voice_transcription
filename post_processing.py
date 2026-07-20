@@ -3,6 +3,9 @@ import json
 from pathlib import Path
 
 def export_transcript_by_speaker(transcript:list, out_path:os.PathLike):
+    """
+    Format the transcript segments by speaker name.
+    """
     with open(out_path, "w", encoding="utf-8") as f:
         last = None
         for row in transcript:

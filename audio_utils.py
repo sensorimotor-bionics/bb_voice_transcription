@@ -45,5 +45,7 @@ def prepare_audio(input_file: PathLike,
                          parameters=["-ac", "1", "-ar", "16000"])
             
         return len(audio) / 1000 # Duration of audio file in seconds
+    
     except Exception as e:
         print(f"Error converting {input_file} with FFMPEG: {e}")
+        return -1.0
