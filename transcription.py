@@ -221,26 +221,28 @@ def extract_speaker_segment_embeddings(audio: np.ndarray,
         embedding = embedding.squeeze(0).cpu().numpy()
         embeddings.append(embedding / np.linalg.norm(embedding))
 
-    return embeddings
+    # Normalize and denoise
+    embedding_matrix = np.vstack(embeddings)
+    embedding_matrix = embedding_matrix - np.mean(embedding_matrix, axis=0, keepdims=True)
+    norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12 
+    embedding_matrix = embedding_matrix / norms
 
+    return embedding_matrix
 
-def get_pairwise_similarity(embeddings: list[np.ndarray]):
-    # Compute similarity between each pair of embeddings
-    similarity_mat = np.zeros((len(embeddings), len(embeddings)))
-    for i in range(len(embeddings)):
-        for j in range(len(embeddings)):
-            num = np.dot(embeddings[i], embeddings[j])
-            denom = ((np.dot(embeddings[i], embeddings[i]) * np.dot(embeddings[j], embeddings[j])) ** 0.5)
-            similarity_mat[i,j] = num / denom
-    
-    return similarity_mat
 
 def cluster_embeddings(distance_mat: np.ndarray,
-                       num_speakers: int | None = None):
+                       num_speakers: int | None = None,
+                       distance_threshold = 0.75):
     if num_speakers is None:
-        feature_clusterer = AgglomerativeClustering(n_clusters=None, metric='precomputed', linkage='average', distance_threshold=0.75)
+        feature_clusterer = AgglomerativeClustering(n_clusters=None,
+                                                    metric='precomputed',
+                                                    linkage='average',
+                                                    distance_threshold=distance_threshold)
     elif isinstance(num_speakers, int):
-        feature_clusterer = AgglomerativeClustering(n_clusters=2, metric='precomputed', linkage='average')
+        feature_clusterer = AgglomerativeClustering(n_clusters=2,
+                                                    metric='precomputed',
+                                                    linkage='average')
 
     return feature_clusterer.fit_predict(distance_mat)
     
@@ -262,7 +264,7 @@ def post_hoc_diarization(transcript: list[dict],
     # Get embeddings
     embeddings = extract_speaker_segment_embeddings(audio, enc_model, speaker_start_times, speaker_stop_times, device, sample_frequency)
     # Compute similarity and classify
-    similarity_mat = get_pairwise_similarity(embeddings)
+    similarity_mat = np.dot(embeddings, embeddings.T)
     distance_mat = 1-similarity_mat
 
     # Cluster to get harmonized speaker labels
