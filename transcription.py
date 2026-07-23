@@ -102,6 +102,8 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
 
     # If audio duration exceeds max then chunk
     if chunked_diarization:
+        num_chunks = np.ceil(audio_duration / max_audio_length)
+        optimal_chunk_length = audio_duration / num_chunks
         # Identify gaps in segments
         segment_times = np.zeros((len(segments), 3))
         for i, segment in enumerate(segments):
@@ -111,18 +113,26 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
         segment_times[1:,2] = segment_times[1:, 0] - segment_times[:-1, 1]
 
         # Loop through segments to find gaps and diarize in chunks
-        start_time, stop_time = -1, max_audio_length
+        start_time, stop_time = -1, optimal_chunk_length
         speaker_times = []
         chunk_counter = 1
-        while start_time < segment_times[-1,1]:
+        while start_time < segment_times[-1,0]:
             if verbose:
-                print(f"\t- Chunk {chunk_counter}")
-            # Find the indices of the segments in the range of the start and stop time
-            sub_seg_idx = np.where(((segment_times[:,0] > start_time) & 
-                            (segment_times[:,1] < stop_time) & 
-                            (segment_times[:,2] > 1)))[0]
-            start_idx = sub_seg_idx[0]
-            stop_idx = sub_seg_idx[-1]
+                print(f"\t- Chunk {chunk_counter}: {start_time:0.1f}-{stop_time:0.1f}")
+
+            # Check that we don't leave a section at the end hanging
+            if (audio_duration - start_time) < max_audio_length:
+                sub_seg_idx = np.where((segment_times[:,0] > start_time))[0]
+                start_idx = sub_seg_idx[0]
+                stop_idx = -1
+            else:
+                # Find the indices of the segments in the range of the start and stop time
+                sub_seg_idx = np.where(((segment_times[:,0] > start_time) & 
+                                        (segment_times[:,1] < stop_time) & 
+                                        (segment_times[:,2] > 1)))[0]
+
+                start_idx = sub_seg_idx[0]
+                stop_idx = sub_seg_idx[-1]
             
             # Diarize audio chunk
             diar_prediction = _diarize(diar_model,
@@ -133,7 +143,7 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
 
             # Update 
             start_time = segment_times[stop_idx,1]
-            stop_time = start_time + max_audio_length
+            stop_time = start_time + optimal_chunk_length
             chunk_counter += 1        
     
     else: # Otherwise process the whole file
