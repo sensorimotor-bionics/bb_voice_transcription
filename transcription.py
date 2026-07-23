@@ -17,23 +17,45 @@ os.environ["NEMO_LOG_LEVEL"] = "40"
 nemo_logging.set_verbosity(nemo_logging.ERROR)
 
 
-def transcribe(audio_path: os.PathLike, whisper_size: str) -> list[Segment]:
+def transcribe(audio_path: os.PathLike,
+               whisper_size: str = "small",
+               model: WhisperModel | None = None) -> list[Segment]:
     """
     Wrapper for using WhisperModel to transcribe an audio file.
 
     Args:
         audio_path (os.PathLike): Path to file.
         whisper_size (str): WhisperModel size ["tiny", "small", "large-v3", etc]
+        model (WhisperModel | None): Pre-loaded WhisperModel instance to reuse across calls.
 
     Returns:
         list[Segment]: List of word segments
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "auto" if device == "cuda" else "int8"
-    model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
+    if model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "auto" if device == "cuda" else "int8"
+        model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
+    
     segments, _ = model.transcribe(str(audio_path), beam_size=5, word_timestamps=True)
     
     return list(segments) # Full list of word segments for whole file
+
+
+def detect_speech(segments: list[Segment], min_speech_duration: float = 0.5) -> bool:
+    """
+    Determines if there is speech present in the transcribed segments.
+
+    Args:
+        segments (list[Segment]): List of Whisper segments.
+        min_speech_duration (float): Minimum total duration of speech segments in seconds.
+
+    Returns:
+        bool: True if speech is detected, False otherwise.
+    """
+    if not segments:
+        return False
+    speech_duration = sum(s.end - s.start for s in segments if s.text and s.text.strip())
+    return speech_duration >= min_speech_duration
 
 
 def format_diarization(prediction: list[str],
@@ -84,7 +106,8 @@ def _diarize(diarizatrion_model: SortformerEncLabelModel,
                                             verbose=False)
 
     # Delete the manifest file
-    os.remove(manifest_path)
+    if os.path.exists(manifest_path):
+        os.remove(manifest_path)
 
     # Return the processed prediction
     return prediction # type: ignore
@@ -192,6 +215,8 @@ def create_transcript(segments: list[Segment],
 
 def get_transcript_speakers(transcript: list[dict]):
     # Get segments split by predicted speaker
+    if not transcript:
+        return [], [], []
     speaker = transcript[0]['speaker']
     num_segments = len(transcript)
     speaker_start_times, speaker_stop_times, speakers = [0], [], [speaker]
@@ -246,6 +271,9 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
         else:
             speaker_embeddings.append(np.zeros(encoding_model.d_model))
 
+    if not speaker_embeddings:
+        return np.empty((0, encoding_model.d_model))
+
     # Denoise and normalize the speaker embedding matrix
     embedding_matrix = np.vstack(speaker_embeddings)
     if len(speaker_embeddings) > 1:
@@ -260,14 +288,17 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
 
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
-                       distance_threshold = 0.75):
+                       distance_threshold: float = 0.75):
+    if len(distance_mat) <= 1:
+        return np.zeros(len(distance_mat), dtype=int)
+        
     if num_speakers is None:
         feature_clusterer = AgglomerativeClustering(n_clusters=None,
                                                     metric='precomputed',
                                                     linkage='average',
                                                     distance_threshold=distance_threshold)
     elif isinstance(num_speakers, int):
-        feature_clusterer = AgglomerativeClustering(n_clusters=num_speakers,
+        feature_clusterer = AgglomerativeClustering(n_clusters=min(num_speakers, len(distance_mat)),
                                                     metric='precomputed',
                                                     linkage='average')
 
@@ -276,13 +307,18 @@ def cluster_embeddings(distance_mat: np.ndarray,
 
 def post_hoc_diarization(transcript: list[dict], 
                          audio_path: os.PathLike,
-                         num_speakers: int | None = None):
+                         num_speakers: int | None = None,
+                         enc_model: EncDecSpeakerLabelModel | None = None):
     
     # Identify all unique chunk-level speakers in the transcript
     unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
+    if not unique_speakers:
+        return transcript
 
     # Extract averaged speaker embeddings for each unique speaker
-    enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
+    if enc_model is None:
+        enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
+    
     device = next(enc_model.parameters()).device
     sample_frequency = 16000
     audio, _ = librosa.load(audio_path, sr=sample_frequency)
@@ -296,9 +332,12 @@ def post_hoc_diarization(transcript: list[dict],
         sample_frequency=sample_frequency
     )
 
+    if len(embedding_matrix) == 0:
+        return transcript
+
     # Cluster chunk speakers into global speaker IDs
     similarity_mat = np.dot(embedding_matrix, embedding_matrix.T)
-    distance_mat = 1 - similarity_mat
+    distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
     speaker_labels = cluster_embeddings(distance_mat, num_speakers)
 
     # Create mapping dict (e.g. {'speaker_10': 'speaker_0', 'speaker_20': 'speaker_0'})
@@ -317,18 +356,12 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  max_audio_length: int = 600,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
-                                 cleanup: bool = True):
+                                 cleanup: bool = True,
+                                 whisper_model: WhisperModel | None = None,
+                                 diar_model: SortformerEncLabelModel | None = None,
+                                 enc_model: EncDecSpeakerLabelModel | None = None):
     """
     High level function to process, transcribe, and diarize a single audio file.
-
-    Args:
-        audio_path (os.PathLike): Path to the file to be processed.
-        whisper_size (str, optional): Which whisper model to use. Defaults to "small".
-        transcription_path (str | None, optional): Output path for the resulting transcript. Defaults to None.
-        max_audio_length (int, optional): Maximum duration of audio file to used before using a chunked approach. Defaults to 600.
-        verbose (bool, optional): Extra print statements. Defaults to False.
-        num_speakers (int | None, optional): How many speakers are present for the classification. Defaults to 2.
-        cleanup (bool, optional): Automatically delete intermediary files. Defaults to True.
     """
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
@@ -360,12 +393,20 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         print(f"\tDuration = {audio_duration} seconds")
 
     ### FasterWhisper transcription
-    print("\tInitalizing transcription")
-    segments = transcribe(audio_path, whisper_size)
+    print("\tInitializing transcription")
+    segments = transcribe(audio_path, whisper_size, model=whisper_model)
     
+    if not detect_speech(segments):
+        print("\tNo speech detected in audio file.")
+        if cleanup and os.path.exists(audio_path) and audio_path.suffix == ".16k.wav" and audio_path_bk != audio_path:
+            os.remove(audio_path)
+        return []
+
     ### NeMo diarization
-    print("\tInitalizing diarization")
-    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval() # type: ignore
+    print("\tInitializing diarization")
+    if diar_model is None:
+        diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval() # type: ignore
+    
     speaker_times, needs_post_hoc = diarize_audio(diar_model,
                                                   audio_path,
                                                   segments,
@@ -378,7 +419,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     # Harmonize diarization across chunks
     if needs_post_hoc:
-        transcript = post_hoc_diarization(transcript, audio_path, num_speakers)
+        transcript = post_hoc_diarization(transcript, audio_path, num_speakers, enc_model=enc_model)
 
     # Dump the transcript as .txt
     export_transcript_by_speaker(transcript, transcription_path.with_suffix(".txt"))
@@ -393,3 +434,241 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     if cleanup:
         if (os.path.exists(audio_path) and audio_path.suffix == ".16k.wav" and audio_path_bk != audio_path):
             os.remove(audio_path)
+
+    return transcript
+
+
+def transcribe_and_diarize_folder(
+    folder_path: os.PathLike,
+    output_dir: os.PathLike | None = None,
+    whisper_size: str = "small",
+    video_extensions: list[str] | None = None,
+    max_audio_length: int = 600,
+    min_speech_duration: float = 0.5,
+    global_num_speakers: int | None = None,
+    distance_threshold: float = 0.75,
+    verbose: bool = False,
+    cleanup: bool = True
+) -> dict:
+    """
+    Processes a folder of video/audio files:
+    1. Transcribes each file and determines if speech is present.
+    2. For files with speech, diarizes speaker turns and extracts speaker embeddings.
+    3. Performs global cross-file speaker classification across all files.
+    4. Saves transcript text, JSON, and a batch summary report.
+
+    Args:
+        folder_path (os.PathLike): Folder containing video/audio files.
+        output_dir (os.PathLike | None): Target output directory. Defaults to <folder_path>/transcripts.
+        whisper_size (str): Model size for FasterWhisper ("tiny", "small", "large-v3", etc.).
+        video_extensions (list[str] | None): Allowed file extensions.
+        max_audio_length (int): Chunk threshold in seconds for diarization.
+        min_speech_duration (float): Minimum duration of speech to qualify as having speech.
+        global_num_speakers (int | None): Known total number of global speakers across all files (or None for threshold-based).
+        distance_threshold (float): Clustering distance threshold when global_num_speakers is None.
+        verbose (bool): Extra logging.
+        cleanup (bool): Automatically remove intermediate 16k WAV files.
+
+    Returns:
+        dict: Batch summary dictionary containing statistics and file details.
+    """
+    folder_path = Path(folder_path)
+    assert folder_path.is_dir(), f"{folder_path} is not a valid directory"
+
+    if output_dir is None:
+        output_dir = folder_path / "transcripts"
+    else:
+        output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if video_extensions is None:
+        video_extensions = [".mp4", ".m4v", ".avi", ".mov", ".mkv", ".wav", ".mp3", ".flac", ".m4a", ".aac"]
+    video_extensions = [ext.lower() for ext in video_extensions]
+
+    # Discover candidate files
+    media_files = sorted([
+        f for f in folder_path.iterdir()
+        if f.is_file() and f.suffix.lower() in video_extensions
+    ])
+
+    if not media_files:
+        print(f"No media files with extensions {video_extensions} found in {folder_path}")
+        return {"total_files": 0, "files_with_speech": 0, "files_without_speech": 0, "files": []}
+
+    print(f"Found {len(media_files)} media file(s) in {folder_path}")
+
+    # Initialize models once
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "auto" if device == "cuda" else "int8"
+    print(f"Loading models on {device} ({compute_type})...")
+
+    whisper_model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
+    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval() # type: ignore
+    enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
+
+    file_records = []
+    all_speaker_embeddings = []
+    embedding_metadata = [] # stores {"speech_file_idx": int, "local_speaker": str}
+
+    speech_file_count = 0
+
+    for idx, file_path in enumerate(media_files, start=1):
+        print(f"\n--- [{idx}/{len(media_files)}] Processing: {file_path.name} ---")
+        
+        # Prepare 16kHz WAV audio
+        wav_path = file_path.with_suffix(".16k.wav")
+        audio_duration = prepare_audio(file_path, wav_path)
+
+        if audio_duration < 0:
+            print(f"Error processing audio for {file_path.name}. Skipping.")
+            file_records.append({
+                "file_name": file_path.name,
+                "has_speech": False,
+                "duration": 0.0,
+                "speaker_count": 0,
+                "error": "Audio conversion failed"
+            })
+            continue
+
+        # Transcribe
+        segments = transcribe(wav_path, whisper_size=whisper_size, model=whisper_model)
+        has_speech = detect_speech(segments, min_speech_duration=min_speech_duration)
+
+        if not has_speech:
+            print(f"\tNo speech detected in {file_path.name}.")
+            file_records.append({
+                "file_name": file_path.name,
+                "stem": file_path.stem,
+                "has_speech": False,
+                "duration": audio_duration,
+                "speaker_count": 0,
+                "transcript": [],
+                "speakers": []
+            })
+            if cleanup and os.path.exists(wav_path) and wav_path != file_path:
+                os.remove(wav_path)
+            continue
+
+        print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
+        speaker_times, _ = diarize_audio(diar_model, wav_path, segments, audio_duration, max_audio_length, verbose=verbose)
+        transcript = create_transcript(segments, speaker_times)
+
+        # Extract speaker embeddings for local unique speakers
+        unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
+        audio, _ = librosa.load(wav_path, sr=16000)
+
+        emb_matrix = extract_unique_speaker_embeddings(
+            transcript=transcript,
+            unique_speakers=unique_speakers,
+            audio=audio,
+            encoding_model=enc_model,
+            device=device,
+            sample_frequency=16000
+        )
+
+        for spk_idx, local_spk in enumerate(unique_speakers):
+            if spk_idx < len(emb_matrix):
+                all_speaker_embeddings.append(emb_matrix[spk_idx])
+                embedding_metadata.append({
+                    "speech_file_idx": speech_file_count,
+                    "local_speaker": local_spk
+                })
+
+        file_records.append({
+            "file_name": file_path.name,
+            "stem": file_path.stem,
+            "has_speech": True,
+            "duration": audio_duration,
+            "speech_file_idx": speech_file_count,
+            "local_speakers": unique_speakers,
+            "transcript": transcript
+        })
+        speech_file_count += 1
+
+        if cleanup and os.path.exists(wav_path) and wav_path != file_path:
+            os.remove(wav_path)
+
+    # Perform global speaker classification across all speech files
+    total_global_speakers = 0
+    if all_speaker_embeddings:
+        print(f"\nRunning cross-file speaker clustering across {len(all_speaker_embeddings)} local speaker representation(s)...")
+        global_matrix = np.vstack(all_speaker_embeddings)
+        if len(all_speaker_embeddings) > 1:
+            global_matrix = global_matrix - np.mean(global_matrix, axis=0, keepdims=True)
+        
+        norms = np.linalg.norm(global_matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-12
+        global_matrix = global_matrix / norms
+
+        similarity_mat = np.dot(global_matrix, global_matrix.T)
+        distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
+
+        global_labels = cluster_embeddings(distance_mat, num_speakers=global_num_speakers, distance_threshold=distance_threshold)
+        unique_global_labels = sorted(list(set(global_labels)))
+        total_global_speakers = len(unique_global_labels)
+
+        # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
+        file_spk_mappings = {}
+        for meta, g_label in zip(embedding_metadata, global_labels):
+            sf_idx = meta["speech_file_idx"]
+            loc_spk = meta["local_speaker"]
+            if sf_idx not in file_spk_mappings:
+                file_spk_mappings[sf_idx] = {}
+            file_spk_mappings[sf_idx][loc_spk] = f"speaker_{g_label}"
+
+        # Remap transcripts and export files
+        for rec in file_records:
+            if not rec.get("has_speech", False):
+                continue
+            sf_idx = rec["speech_file_idx"]
+            spk_map = file_spk_mappings.get(sf_idx, {})
+            
+            for t in rec["transcript"]:
+                t["speaker"] = spk_map.get(t["speaker"], t["speaker"])
+            
+            # Update speakers present list
+            rec["speakers"] = sorted(list(set(t["speaker"] for t in rec["transcript"])))
+            rec["speaker_count"] = len(rec["speakers"])
+
+            # Save txt transcript
+            txt_out = output_dir / f"{rec['stem']}_transcript.txt"
+            export_transcript_by_speaker(rec["transcript"], txt_out)
+
+            # Save json transcript
+            json_out = output_dir / f"{rec['stem']}_transcript.json"
+            with open(json_out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec["transcript"], indent=4) + "\n")
+            
+            print(f"\tSaved global transcript for {rec['file_name']} -> {txt_out.name}")
+
+    # Build summary
+    summary_file_details = []
+    for rec in file_records:
+        detail = {
+            "file_name": rec["file_name"],
+            "has_speech": rec["has_speech"],
+            "duration_seconds": round(rec["duration"], 2)
+        }
+        if rec["has_speech"]:
+            detail["speaker_count"] = rec.get("speaker_count", 0)
+            detail["speakers"] = rec.get("speakers", [])
+        else:
+            detail["speaker_count"] = 0
+            detail["speakers"] = []
+        summary_file_details.append(detail)
+
+    batch_summary = {
+        "folder_path": str(folder_path),
+        "total_files": len(media_files),
+        "files_with_speech": speech_file_count,
+        "files_without_speech": len(media_files) - speech_file_count,
+        "total_global_speakers": total_global_speakers,
+        "file_details": summary_file_details
+    }
+
+    summary_path = output_dir / "batch_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(batch_summary, indent=4) + "\n")
+    print(f"\nBatch processing complete! Summary written to {summary_path}")
+
+    return batch_summary
