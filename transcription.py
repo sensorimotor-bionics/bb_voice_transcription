@@ -45,7 +45,7 @@ def format_diarization(prediction: list[str],
     for line in prediction:
         start, end, speaker = line.split()
         if speaker_offset > 0:
-            spk_int = int(speaker[-1])
+            spk_int = int(speaker.split('_')[-1])
             speaker = f"speaker_{spk_int+speaker_offset}"
         speaker_turns.append({"start": float(start), "end": float(end), "speaker": speaker})
 
@@ -108,7 +108,7 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
             segment_times[i,0] = segment.start
             segment_times[i,1] = segment.end
 
-        segment_times[1:,2] = segment_times[1:,1] - segment_times[:-1,0]
+        segment_times[1:,2] = segment_times[1:, 0] - segment_times[:-1, 1]
 
         # Loop through segments to find gaps and diarize in chunks
         start_time, stop_time = -1, max_audio_length
@@ -148,6 +148,8 @@ def assign_speaker(segment: Segment,
     """
     Assign speaker to word segment based on maximum overlap from diarization output.
     """
+
+    best = "unknown"
     votes = {}
     # For each word in the segment
     for w in (segment.words or []): # type: ignore
@@ -159,6 +161,7 @@ def assign_speaker(segment: Segment,
                 best_overlap, best = overlap, t["speaker"]
 
         votes[best] = votes.get(best, 0.0) + (w.end - w.start)
+
     return max(votes, key=votes.get) if votes else best # type: ignore
 
 
@@ -198,32 +201,46 @@ def get_transcript_speakers(transcript: list[dict]):
     return speakers, speaker_start_times, speaker_stop_times
 
 
-def extract_speaker_segment_embeddings(audio: np.ndarray,
-                                       encoding_model: EncDecSpeakerLabelModel,
-                                       speaker_start_times: list[float],
-                                       speaker_stop_times: list[float],
-                                       device: str,
-                                       sample_frequency:int):
-    # Manually compute embeddings
-    embeddings = []
-    for (start, stop) in zip(speaker_start_times, speaker_stop_times):
-        # Get segment indices for audio file
-        start_idx = int(start * sample_frequency)
-        stop_idx = int(stop * sample_frequency)
-        audio_tensor = torch.tensor(audio[start_idx:stop_idx], dtype=torch.float32).unsqueeze(0).to(device)
-        audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.int32).to(device)
+def extract_unique_speaker_embeddings(transcript: list[dict],
+                                      unique_speakers: list[str],
+                                      audio: np.ndarray,
+                                      encoding_model: EncDecSpeakerLabelModel,
+                                      device: str,
+                                      sample_frequency: int = 16000) -> np.ndarray:
+    """
+    Extracts, averages, and normalizes speaker embeddings for each unique speaker tag in the transcript.
+    Useful as a standalone function for debugging speaker representations.
+    """
+    speaker_embeddings = []
+    for spk in unique_speakers:
+        spk_segments = [t for t in transcript if t['speaker'] == spk]
+        
+        seg_embeddings = []
+        for seg in spk_segments:
+            start_idx = int(seg['start'] * sample_frequency)
+            stop_idx = int(seg['end'] * sample_frequency)
+            if stop_idx - start_idx < 160:  # Skip empty or sub-10ms audio slices
+                continue
+            audio_tensor = torch.tensor(audio[start_idx:stop_idx], dtype=torch.float32).unsqueeze(0).to(device)
+            audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.int32).to(device)
+            
+            with torch.no_grad():
+                _, emb = encoding_model.forward(input_signal=audio_tensor, input_signal_length=audio_len)
+            emb = emb.squeeze(0).cpu().numpy()
+            seg_embeddings.append(emb / np.linalg.norm(emb))
 
-        # Get the embedding from the encoding model
-        with torch.no_grad():
-            _, embedding = encoding_model.forward(input_signal=audio_tensor, input_signal_length=audio_len)
+        if seg_embeddings:
+            # Average embeddings across all segments for this chunk speaker
+            mean_emb = np.mean(seg_embeddings, axis=0)
+            speaker_embeddings.append(mean_emb / np.linalg.norm(mean_emb))
+        else:
+            speaker_embeddings.append(np.zeros(encoding_model.d_model))
 
-        # Normalize and return to CPU
-        embedding = embedding.squeeze(0).cpu().numpy()
-        embeddings.append(embedding / np.linalg.norm(embedding))
+    # Denoise and normalize the speaker embedding matrix
+    embedding_matrix = np.vstack(speaker_embeddings)
+    if len(speaker_embeddings) > 1:
+        embedding_matrix = embedding_matrix - np.mean(embedding_matrix, axis=0, keepdims=True)
 
-    # Normalize and denoise
-    embedding_matrix = np.vstack(embeddings)
-    embedding_matrix = embedding_matrix - np.mean(embedding_matrix, axis=0, keepdims=True)
     norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1e-12 
     embedding_matrix = embedding_matrix / norms
@@ -240,7 +257,7 @@ def cluster_embeddings(distance_mat: np.ndarray,
                                                     linkage='average',
                                                     distance_threshold=distance_threshold)
     elif isinstance(num_speakers, int):
-        feature_clusterer = AgglomerativeClustering(n_clusters=2,
+        feature_clusterer = AgglomerativeClustering(n_clusters=num_speakers,
                                                     metric='precomputed',
                                                     linkage='average')
 
@@ -251,28 +268,35 @@ def post_hoc_diarization(transcript: list[dict],
                          audio_path: os.PathLike,
                          num_speakers: int | None = None):
     
-    # Get speaker start and stop times for extended 
-    speakers, speaker_start_times, speaker_stop_times = get_transcript_speakers(transcript)
+    # Identify all unique chunk-level speakers in the transcript
+    unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
 
-    # Get an encoding model for feature extraction
+    # Extract averaged speaker embeddings for each unique speaker
     enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
     device = next(enc_model.parameters()).device
-    # load the whole audio file
     sample_frequency = 16000
     audio, _ = librosa.load(audio_path, sr=sample_frequency)
 
-    # Get embeddings
-    embeddings = extract_speaker_segment_embeddings(audio, enc_model, speaker_start_times, speaker_stop_times, device, sample_frequency)
-    # Compute similarity and classify
-    similarity_mat = np.dot(embeddings, embeddings.T)
-    distance_mat = 1-similarity_mat
+    embedding_matrix = extract_unique_speaker_embeddings(
+        transcript=transcript,
+        unique_speakers=unique_speakers,
+        audio=audio,
+        encoding_model=enc_model,
+        device=device,
+        sample_frequency=sample_frequency
+    )
 
-    # Cluster to get harmonized speaker labels
+    # Cluster chunk speakers into global speaker IDs
+    similarity_mat = np.dot(embedding_matrix, embedding_matrix.T)
+    distance_mat = 1 - similarity_mat
     speaker_labels = cluster_embeddings(distance_mat, num_speakers)
 
-    # Update the transcript
+    # Create mapping dict (e.g. {'speaker_10': 'speaker_0', 'speaker_20': 'speaker_0'})
+    spk_to_global = {spk: f"speaker_{label}" for spk, label in zip(unique_speakers, speaker_labels)}
+
+    # Remap transcript
     for t in transcript:
-        t['speaker'] = f"speaker_{speaker_labels[speakers.index(t['speaker'])]}"
+        t['speaker'] = spk_to_global[t['speaker']]
 
     return transcript
 
@@ -307,7 +331,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     
     # Parse the transcription path
     if transcription_path is None:
-        transcription_path = audio_path.stem + "_transcript.txt"
+        transcription_path = audio_path.with_name(audio_path.stem + "_transcript")
     else:
         if not isinstance(transcription_path, (str, bytes, os.PathLike)):
             raise TypeError("transcription_path must be a PathLike")
@@ -347,10 +371,10 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
         transcript = post_hoc_diarization(transcript, audio_path, num_speakers)
 
     # Dump the transcript as .txt
-    export_transcript_by_speaker(transcript, audio_path.with_suffix(".transcript.txt"))
+    export_transcript_by_speaker(transcript, transcription_path.with_suffix(".txt"))
 
     # Dump the transcript as .json for later parsing
-    out_path = audio_path.with_suffix(".transcript.json")
+    out_path = transcription_path.with_suffix(".json")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(transcript, indent=4) + "\n")
 

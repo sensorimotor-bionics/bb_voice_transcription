@@ -16,7 +16,7 @@ def trim_wav(input_file: PathLike,
         'ffmpeg',
         '-ss', str(start_time),           # Start at the very beginning
         '-i', input_file,     # Input file
-        '-t', str(stop_time),  # Duration in seconds
+        '-to', str(stop_time),  # Duration in seconds
         '-c', 'copy',         # Copy audio without re-encoding (preserves quality)
         output_file
     ]
