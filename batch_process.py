@@ -32,6 +32,7 @@ def main():
         min_speech_duration=args.min_speech_duration,
         verbose=args.verbose
     )
+    print(summary)
     print("Batch processing completed successfully.")
 
 if __name__ == "__main__":

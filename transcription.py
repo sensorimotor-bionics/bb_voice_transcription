@@ -36,7 +36,12 @@ def transcribe(audio_path: os.PathLike,
         compute_type = "auto" if device == "cuda" else "int8"
         model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
     
-    segments, _ = model.transcribe(str(audio_path), beam_size=5, word_timestamps=True)
+    segments, _ = model.transcribe(str(audio_path),
+                                   beam_size=5,
+                                   word_timestamps=True,
+                                   vad_filter=True,
+                                   condition_on_previous_text=False,
+                                   language="en")
     
     return list(segments) # Full list of word segments for whole file
 
@@ -557,6 +562,8 @@ def transcribe_and_diarize_folder(
         unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
         audio, _ = librosa.load(wav_path, sr=16000)
 
+        print(transcript)
+
         emb_matrix = extract_unique_speaker_embeddings(
             transcript=transcript,
             unique_speakers=unique_speakers,
@@ -589,7 +596,6 @@ def transcribe_and_diarize_folder(
             os.remove(wav_path)
 
     # Perform global speaker classification across all speech files
-    total_global_speakers = 0
     if all_speaker_embeddings:
         print(f"\nRunning cross-file speaker clustering across {len(all_speaker_embeddings)} local speaker representation(s)...")
         global_matrix = np.vstack(all_speaker_embeddings)
@@ -604,8 +610,6 @@ def transcribe_and_diarize_folder(
         distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
 
         global_labels = cluster_embeddings(distance_mat, num_speakers=global_num_speakers, distance_threshold=distance_threshold)
-        unique_global_labels = sorted(list(set(global_labels)))
-        total_global_speakers = len(unique_global_labels)
 
         # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
         file_spk_mappings = {}
@@ -641,34 +645,4 @@ def transcribe_and_diarize_folder(
             
             print(f"\tSaved global transcript for {rec['file_name']} -> {txt_out.name}")
 
-    # Build summary
-    summary_file_details = []
-    for rec in file_records:
-        detail = {
-            "file_name": rec["file_name"],
-            "has_speech": rec["has_speech"],
-            "duration_seconds": round(rec["duration"], 2)
-        }
-        if rec["has_speech"]:
-            detail["speaker_count"] = rec.get("speaker_count", 0)
-            detail["speakers"] = rec.get("speakers", [])
-        else:
-            detail["speaker_count"] = 0
-            detail["speakers"] = []
-        summary_file_details.append(detail)
-
-    batch_summary = {
-        "folder_path": str(folder_path),
-        "total_files": len(media_files),
-        "files_with_speech": speech_file_count,
-        "files_without_speech": len(media_files) - speech_file_count,
-        "total_global_speakers": total_global_speakers,
-        "file_details": summary_file_details
-    }
-
-    summary_path = output_dir / "batch_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(batch_summary, indent=4) + "\n")
-    print(f"\nBatch processing complete! Summary written to {summary_path}")
-
-    return batch_summary
+    print("Batch processing complete!")
