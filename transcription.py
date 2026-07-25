@@ -645,4 +645,18 @@ def transcribe_and_diarize_folder(
             
             print(f"\tSaved global transcript for {rec['file_name']} -> {txt_out.name}")
 
+    summary = {
+        "total_files": len(media_files),
+        "files_with_speech": speech_file_count,
+        "files_without_speech": len(media_files) - speech_file_count,
+        "files": file_records,
+        "output_dir": str(output_dir)
+    }
+
+    summary_path = output_dir / "batch_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=4)
+
+    print(f"\tSaved batch summary to {summary_path.name}")
     print("Batch processing complete!")
+    return summary
