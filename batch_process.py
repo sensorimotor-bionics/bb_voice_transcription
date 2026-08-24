@@ -1,7 +1,7 @@
 import argparse
 import sys
 from pathlib import Path
-from transcription import transcribe_and_diarize_folder
+from transcription import transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD
 
 def main():
     parser = argparse.ArgumentParser(
@@ -11,7 +11,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for transcripts and summary report")
     parser.add_argument("--whisper_size", type=str, default="small", choices=["tiny", "base", "small", "medium", "large-v3"], help="Whisper model size")
     parser.add_argument("--global_num_speakers", type=int, default=None, help="Known number of global speakers across all files (optional)")
-    parser.add_argument("--distance_threshold", type=float, default=0.75, help="Agglomerative clustering distance threshold")
+    parser.add_argument("--distance_threshold", type=float, default=DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                        help="Cosine distance below which two local speakers are merged (unused if --global_num_speakers is set)")
     parser.add_argument("--min_speech_duration", type=float, default=0.5, help="Minimum seconds of speech required per file")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging during processing")
 

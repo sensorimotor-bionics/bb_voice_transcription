@@ -19,6 +19,14 @@ nemo_logging.set_verbosity(nemo_logging.ERROR)
 # Suffix used for the intermediate 16 kHz mono WAV that everything downstream reads.
 PREPARED_AUDIO_SUFFIX = ".16k.wav"
 
+# Cosine distance below which two speaker embeddings are taken to be the same person.
+# It applies to raw (uncentered) L2-normalized TitaNet embeddings, where same-speaker
+# pairs typically sit well under 0.3 and different speakers well above it. This is a
+# starting point, not a tuned value: run with verbose=True to print the pairwise
+# distances for your own recordings (report_speaker_distances) and adjust. Only used
+# when the speaker count is unknown; passing num_speakers/global_num_speakers ignores it.
+DEFAULT_SPEAKER_DISTANCE_THRESHOLD = 0.35
+
 
 def _remove_prepared_audio(prepared_path: os.PathLike, original_path: os.PathLike) -> None:
     """
@@ -278,20 +286,80 @@ def get_transcript_speakers(transcript: list[dict]):
     return speakers, speaker_start_times, speaker_stop_times
 
 
+def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    """L2-normalize each row, leaving all-zero rows alone rather than dividing by 0."""
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12
+    return matrix / norms
+
+
+def speaker_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
+    """
+    Pairwise cosine distance between speaker embeddings: 0 is identical, 1 orthogonal,
+    2 opposite. This is the only place speaker similarity is defined, so every caller
+    compares embeddings on the same scale as DEFAULT_SPEAKER_DISTANCE_THRESHOLD.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    if len(embeddings) == 0:
+        return np.empty((0, 0))
+    normalized = _normalize_rows(embeddings)
+    return np.clip(1.0 - np.dot(normalized, normalized.T), 0.0, 2.0)
+
+
+def report_speaker_distances(labels: list[str],
+                             distance_mat: np.ndarray,
+                             distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD) -> None:
+    """
+    Print the pairwise distances behind a clustering decision, for tuning
+    distance_threshold on your own recordings: pairs you know are the same person
+    should land below the threshold, pairs you know differ should land above it.
+    """
+    if len(labels) < 2:
+        print(f"\tOnly {len(labels)} speaker embedding(s); no pairs to compare.")
+        return
+
+    width = max(len(str(label)) for label in labels)
+    print(f"\tPairwise speaker distances (threshold {distance_threshold:.2f}):")
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            distance = distance_mat[i, j]
+            verdict = "same" if distance <= distance_threshold else "different"
+            print(f"\t  {str(labels[i]):<{width}} <-> {str(labels[j]):<{width}}  {distance:.3f}  {verdict}")
+
+
 def extract_unique_speaker_embeddings(transcript: list[dict],
                                       unique_speakers: list[str],
                                       audio: np.ndarray,
                                       encoding_model: EncDecSpeakerLabelModel,
-                                      device: str,
-                                      sample_frequency: int = 16000) -> np.ndarray:
+                                      device: str | torch.device,
+                                      sample_frequency: int = 16000,
+                                      center: bool = False) -> tuple[np.ndarray, list[str]]:
     """
-    Extracts, averages, and normalizes speaker embeddings for each unique speaker tag in the transcript.
+    Averages per-segment speaker embeddings into one L2-normalized embedding per speaker.
     Useful as a standalone function for debugging speaker representations.
+
+    Args:
+        transcript (list[dict]): Segments carrying 'speaker', 'start' and 'end'.
+        unique_speakers (list[str]): Speaker tags to embed, in the desired row order.
+        audio (np.ndarray): Mono waveform at sample_frequency.
+        encoding_model (EncDecSpeakerLabelModel): Speaker encoder (e.g. TitaNet).
+        device (str | torch.device): Device the encoder lives on.
+        sample_frequency (int): Sample rate of `audio`.
+        center (bool): Subtract the mean of *this call's* embeddings before normalizing.
+            This spreads distances inside one pool, but makes the result depend on the
+            pool it was computed in: with two speakers it forces them exactly antipodal,
+            and embeddings from separate calls stop being comparable at all. Leave it off
+            whenever the output is compared against embeddings from another call.
+
+    Returns:
+        tuple[np.ndarray, list[str]]: (embeddings, speakers), where row i of embeddings
+        belongs to speakers[i]. Speakers with no usable audio are dropped from both, so
+        the two always stay aligned.
     """
-    speaker_embeddings = []
+    speaker_embeddings, valid_speakers = [], []
     for spk in unique_speakers:
         spk_segments = [t for t in transcript if t['speaker'] == spk]
-        
+
         seg_embeddings = []
         for seg in spk_segments:
             start_idx = int(seg['start'] * sample_frequency)
@@ -300,58 +368,68 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
                 continue
             audio_tensor = torch.tensor(audio[start_idx:stop_idx], dtype=torch.float32).unsqueeze(0).to(device)
             audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.int32).to(device)
-            
+
             with torch.no_grad():
                 _, emb = encoding_model.forward(input_signal=audio_tensor, input_signal_length=audio_len)
             emb = emb.squeeze(0).cpu().numpy()
-            seg_embeddings.append(emb / np.linalg.norm(emb))
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                seg_embeddings.append(emb / norm)
 
+        # A speaker with no usable audio is dropped rather than represented by a zero
+        # row: a zero row survives normalization as garbage and drags a real cluster
+        # towards it. Callers keep such speakers on their original label instead.
         if seg_embeddings:
-            # Average embeddings across all segments for this chunk speaker
             mean_emb = np.mean(seg_embeddings, axis=0)
-            speaker_embeddings.append(mean_emb / np.linalg.norm(mean_emb))
-        else:
-            speaker_embeddings.append(np.zeros(encoding_model.d_model))
+            norm = np.linalg.norm(mean_emb)
+            if norm > 0:
+                speaker_embeddings.append(mean_emb / norm)
+                valid_speakers.append(spk)
 
     if not speaker_embeddings:
-        return np.empty((0, encoding_model.d_model))
+        return np.empty((0, 0)), []
 
-    # Denoise and normalize the speaker embedding matrix
     embedding_matrix = np.vstack(speaker_embeddings)
-    if len(speaker_embeddings) > 1:
+    if center and len(speaker_embeddings) > 1:
         embedding_matrix = embedding_matrix - np.mean(embedding_matrix, axis=0, keepdims=True)
 
-    norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1e-12 
-    embedding_matrix = embedding_matrix / norms
-
-    return embedding_matrix
+    return _normalize_rows(embedding_matrix), valid_speakers
 
 
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
-                       distance_threshold: float = 0.75):
+                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD):
     if len(distance_mat) <= 1:
         return np.zeros(len(distance_mat), dtype=int)
-        
+
     if num_speakers is None:
         feature_clusterer = AgglomerativeClustering(n_clusters=None,
                                                     metric='precomputed',
                                                     linkage='average',
                                                     distance_threshold=distance_threshold)
-    elif isinstance(num_speakers, int):
-        feature_clusterer = AgglomerativeClustering(n_clusters=min(num_speakers, len(distance_mat)),
+    else:
+        # Accept anything integral (including numpy ints) but reject 2.5 or "two"
+        # rather than silently truncating or leaving the clusterer undefined.
+        try:
+            n_clusters = int(num_speakers)
+        except (TypeError, ValueError):
+            raise ValueError(f"num_speakers must be an integer or None, got {num_speakers!r}")
+        if n_clusters != num_speakers or n_clusters < 1:
+            raise ValueError(f"num_speakers must be a positive integer or None, got {num_speakers!r}")
+        feature_clusterer = AgglomerativeClustering(n_clusters=min(n_clusters, len(distance_mat)),
                                                     metric='precomputed',
                                                     linkage='average')
 
     return feature_clusterer.fit_predict(distance_mat)
-    
 
-def post_hoc_diarization(transcript: list[dict], 
+
+def post_hoc_diarization(transcript: list[dict],
                          audio_path: os.PathLike,
                          num_speakers: int | None = None,
-                         enc_model: EncDecSpeakerLabelModel | None = None):
-    
+                         enc_model: EncDecSpeakerLabelModel | None = None,
+                         distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                         verbose: bool = False):
+
     # Identify all unique chunk-level speakers in the transcript
     unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
     if not unique_speakers:
@@ -360,12 +438,12 @@ def post_hoc_diarization(transcript: list[dict],
     # Extract averaged speaker embeddings for each unique speaker
     if enc_model is None:
         enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
-    
+
     device = next(enc_model.parameters()).device
     sample_frequency = 16000
     audio, _ = librosa.load(audio_path, sr=sample_frequency)
 
-    embedding_matrix = extract_unique_speaker_embeddings(
+    embedding_matrix, valid_speakers = extract_unique_speaker_embeddings(
         transcript=transcript,
         unique_speakers=unique_speakers,
         audio=audio,
@@ -378,16 +456,20 @@ def post_hoc_diarization(transcript: list[dict],
         return transcript
 
     # Cluster chunk speakers into global speaker IDs
-    similarity_mat = np.dot(embedding_matrix, embedding_matrix.T)
-    distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
-    speaker_labels = cluster_embeddings(distance_mat, num_speakers)
+    distance_mat = speaker_distance_matrix(embedding_matrix)
+    if verbose:
+        report_speaker_distances(valid_speakers, distance_mat, distance_threshold)
+    speaker_labels = cluster_embeddings(distance_mat, num_speakers, distance_threshold)
 
     # Create mapping dict (e.g. {'speaker_10': 'speaker_0', 'speaker_20': 'speaker_0'})
-    spk_to_global = {spk: f"speaker_{label}" for spk, label in zip(unique_speakers, speaker_labels)}
+    spk_to_global = {spk: f"speaker_{label}" for spk, label in zip(valid_speakers, speaker_labels)}
 
-    # Remap transcript
+    # Remap transcript. Chunk speakers that produced no embedding aren't in the mapping,
+    # so they keep their local label rather than being folded into an arbitrary cluster.
     for t in transcript:
-        t['speaker'] = spk_to_global[t['speaker']]
+        local_speaker = t.get('local_speaker', t['speaker'])
+        t.setdefault('local_speaker', local_speaker)
+        t['speaker'] = spk_to_global.get(local_speaker, local_speaker)
 
     return transcript
 
@@ -398,6 +480,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  max_audio_length: int = 600,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
+                                 distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                                  cleanup: bool = True,
                                  whisper_model: WhisperModel | None = None,
                                  diar_model: SortformerEncLabelModel | None = None,
@@ -470,7 +553,12 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
 
     # Harmonize diarization across chunks
     if needs_post_hoc:
-        transcript = post_hoc_diarization(transcript, audio_path, num_speakers, enc_model=enc_model)
+        transcript = post_hoc_diarization(transcript,
+                                          audio_path,
+                                          num_speakers,
+                                          enc_model=enc_model,
+                                          distance_threshold=distance_threshold,
+                                          verbose=verbose)
 
     # Dump the transcript as .txt
     export_transcript_by_speaker(transcript, transcription_path.with_suffix(".txt"))
@@ -496,7 +584,7 @@ def transcribe_and_diarize_folder(
     max_audio_length: int = 600,
     min_speech_duration: float = 0.5,
     global_num_speakers: int | None = None,
-    distance_threshold: float = 0.75,
+    distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
     verbose: bool = False,
     cleanup: bool = True
 ) -> dict:
@@ -515,7 +603,10 @@ def transcribe_and_diarize_folder(
         max_audio_length (int): Chunk threshold in seconds for diarization.
         min_speech_duration (float): Minimum duration of speech to qualify as having speech.
         global_num_speakers (int | None): Known total number of global speakers across all files (or None for threshold-based).
-        distance_threshold (float): Clustering distance threshold when global_num_speakers is None.
+        distance_threshold (float): Cosine distance below which two local speakers are
+            merged into one global speaker. Only used when global_num_speakers is None;
+            see DEFAULT_SPEAKER_DISTANCE_THRESHOLD, and pass verbose=True to print the
+            pairwise distances it is compared against.
         verbose (bool): Extra logging.
         cleanup (bool): Automatically remove intermediate 16k WAV files.
 
@@ -610,22 +701,30 @@ def transcribe_and_diarize_folder(
         if verbose:
             print(transcript)
 
-        emb_matrix = extract_unique_speaker_embeddings(
+        # center=False: these embeddings are pooled with every other file's below, so
+        # they have to stay in one shared geometry rather than each file's own.
+        emb_matrix, valid_speakers = extract_unique_speaker_embeddings(
             transcript=transcript,
             unique_speakers=unique_speakers,
             audio=audio,
             encoding_model=enc_model,
             device=device,
-            sample_frequency=16000
+            sample_frequency=16000,
+            center=False
         )
 
-        for spk_idx, local_spk in enumerate(unique_speakers):
-            if spk_idx < len(emb_matrix):
-                all_speaker_embeddings.append(emb_matrix[spk_idx])
-                embedding_metadata.append({
-                    "speech_file_idx": speech_file_count,
-                    "local_speaker": local_spk
-                })
+        for local_spk, embedding in zip(valid_speakers, emb_matrix):
+            all_speaker_embeddings.append(embedding)
+            embedding_metadata.append({
+                "speech_file_idx": speech_file_count,
+                "stem": file_path.stem,
+                "local_speaker": local_spk
+            })
+
+        skipped_speakers = [s for s in unique_speakers if s not in valid_speakers]
+        if skipped_speakers:
+            print(f"\tNo usable audio for {', '.join(skipped_speakers)}; "
+                  "keeping their local labels.")
 
         file_records.append({
             "file_name": file_path.name,
@@ -644,19 +743,21 @@ def transcribe_and_diarize_folder(
     if all_speaker_embeddings:
         print(f"\nRunning cross-file speaker clustering across {len(all_speaker_embeddings)} local speaker representation(s)...")
         global_matrix = np.vstack(all_speaker_embeddings)
-        if len(all_speaker_embeddings) > 1:
-            global_matrix = global_matrix - np.mean(global_matrix, axis=0, keepdims=True)
-        
-        norms = np.linalg.norm(global_matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-12
-        global_matrix = global_matrix / norms
+        distance_mat = speaker_distance_matrix(global_matrix)
 
-        similarity_mat = np.dot(global_matrix, global_matrix.T)
-        distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
+        if verbose:
+            report_speaker_distances([f"{m['stem']}:{m['local_speaker']}" for m in embedding_metadata],
+                                     distance_mat,
+                                     distance_threshold)
 
         global_labels = cluster_embeddings(distance_mat,
                                            num_speakers=global_num_speakers,
                                            distance_threshold=distance_threshold)
+        if global_num_speakers is None:
+            print(f"\tFound {len(set(global_labels))} global speaker(s) "
+                  f"at distance_threshold={distance_threshold}")
+        else:
+            print(f"\tSplit into {len(set(global_labels))} global speaker(s) as requested")
 
         # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
         file_spk_mappings = {}
