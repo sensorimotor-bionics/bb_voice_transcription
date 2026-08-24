@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Union, List, Dict, Any
+from typing import Union
 
 
 def export_transcript_by_speaker(transcript: list, out_path: os.PathLike):
@@ -56,12 +56,12 @@ def concatenate_batch_transcripts(
         list[dict]: List of segment dicts with added 'video' and 'file' origin fields.
     """
     file_records = []
-    default_dir = None
+    records_dir = None  # where per-file transcripts referenced by a summary live
 
     if isinstance(batch_input, (str, Path)):
         p = Path(batch_input)
         if p.is_dir():
-            default_dir = p
+            records_dir = p
             summary_file = p / "batch_summary.json"
             if not summary_file.exists():
                 summary_file = p / "summary.json"
@@ -94,7 +94,7 @@ def concatenate_batch_transcripts(
                                 "transcript": seg_data
                             })
         elif p.is_file():
-            default_dir = p.parent
+            records_dir = p.parent
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict) and "files" in data:
@@ -110,14 +110,14 @@ def concatenate_batch_transcripts(
                             row["video"] = v_id
                             row["file"] = v_id
                             concatenated.append(row)
-                        _export_if_requested(concatenated, output_path, default_dir)
+                        dump_transcript(concatenated, output_path)
                         return concatenated
 
     elif isinstance(batch_input, dict):
         if "files" in batch_input:
             file_records = batch_input["files"]
         if "output_dir" in batch_input and batch_input["output_dir"]:
-            default_dir = Path(batch_input["output_dir"])
+            records_dir = Path(batch_input["output_dir"])
 
     elif isinstance(batch_input, list):
         if batch_input and isinstance(batch_input[0], dict) and "transcript" in batch_input[0]:
@@ -130,7 +130,7 @@ def concatenate_batch_transcripts(
                 row["video"] = v_id
                 row["file"] = v_id
                 concatenated.append(row)
-            _export_if_requested(concatenated, output_path, default_dir)
+            dump_transcript(concatenated, output_path)
             return concatenated
 
     concatenated = []
@@ -138,18 +138,37 @@ def concatenate_batch_transcripts(
         if not rec.get("has_speech", True):
             continue
         v_id = rec.get("file_name") or rec.get("stem") or "unknown"
-        segments = rec.get("transcript", [])
-        for seg in segments:
+        segments = rec.get("transcript")
+        # A summary written to disk points at each transcript instead of inlining it
+        if not segments and rec.get("transcript_file"):
+            segments = _load_referenced_transcript(rec["transcript_file"], records_dir)
+        for seg in (segments or []):
             row = dict(seg)
             row["video"] = v_id
             row["file"] = v_id
             concatenated.append(row)
 
-    _export_if_requested(concatenated, output_path, default_dir)
+    dump_transcript(concatenated, output_path)
     return concatenated
 
 
-def _export_if_requested(concatenated: list[dict], output_path: Union[os.PathLike, None], default_dir: Union[Path, None]):
+def _load_referenced_transcript(transcript_file: os.PathLike,
+                                records_dir: Union[Path, None]) -> list[dict]:
+    """Load a transcript that a batch summary references rather than inlines."""
+    path = Path(transcript_file)
+    if not path.is_absolute() and records_dir is not None:
+        path = Path(records_dir) / path
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Could not read referenced transcript {path}: {e}")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def dump_transcript(concatenated: list[dict], 
+                         output_path: Union[os.PathLike, None]):
     if output_path is None:
         return
     out_p = Path(output_path)
@@ -170,6 +189,18 @@ def _export_if_requested(concatenated: list[dict], output_path: Union[os.PathLik
 concatenate_transcripts = concatenate_batch_transcripts
 
 
+def _speaker_sort_key(speaker: str):
+    """
+    Order speaker tags by their trailing number when they have one, so speaker_2 sorts
+    before speaker_10 and both sort before any non-numbered label.
+    """
+    tail = str(speaker).rsplit('_', 1)[-1]
+    try:
+        return (0, int(tail), "")
+    except ValueError:
+        return (1, 0, str(speaker))
+
+
 def relabel_transcript(transcript_path: os.PathLike, speaker_ids: list[str]):
     """
     Relabels generic speaker_0, speaker_N to desired labels.
@@ -184,14 +215,17 @@ def relabel_transcript(transcript_path: os.PathLike, speaker_ids: list[str]):
     elif isinstance(transcript, list) and transcript and ("video" in transcript[0] or "file" in transcript[0]):
         return relabel_batched_transcript(transcript, speaker_ids, output_path=transcript_path)
 
-    # Get list of unique speakers and confirm lengths match
-    speaker_id = [int(t['speaker'].split('_')[-1]) for t in transcript]
-    speaker_list = list(set(speaker_id))
-    assert len(speaker_list) == len(speaker_ids), f"{len(speaker_list)} speakers in transcript but only {len(speaker_ids)} provided"
+    # Map the speakers actually present onto the provided names by position. Speaker
+    # numbers are not necessarily 0..N-1 (clustering can return speaker_0 and speaker_2)
+    # and are not necessarily numeric at all, so indexing by the number would either
+    # run off the end of speaker_ids or fail to parse.
+    present = sorted({t['speaker'] for t in transcript}, key=_speaker_sort_key)
+    assert len(present) == len(speaker_ids), \
+        f"{len(present)} speakers in transcript ({', '.join(present)}) but {len(speaker_ids)} provided"
 
-    # Iterate through the transcript and relabel according to speaker id
-    for (idx, t) in zip(speaker_id, transcript):
-        t['speaker'] = speaker_ids[idx]
+    mapping = dict(zip(present, speaker_ids))
+    for t in transcript:
+        t['speaker'] = mapping[t['speaker']]
 
     # Dump relabeled transcript
     export_transcript_by_speaker(transcript, transcript_path.with_suffix(".relabeled.txt"))
@@ -256,19 +290,18 @@ def relabel_batched_transcript(
             if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
                 mapping[f"speaker_{k}"] = v
     elif isinstance(speaker_ids, (list, tuple)):
-        unique_speakers = list(dict.fromkeys(t["speaker"] for t in concatenated if "speaker" in t))
-        for spk in unique_speakers:
-            if isinstance(spk, str) and spk.startswith("speaker_"):
-                try:
-                    idx = int(spk.split("_")[-1])
-                    if 0 <= idx < len(speaker_ids):
-                        mapping[spk] = speaker_ids[idx]
-                except ValueError:
-                    pass
-        unmapped = [s for s in unique_speakers if s not in mapping]
-        for i, spk in enumerate(unmapped):
-            if i < len(speaker_ids):
-                mapping[spk] = speaker_ids[i]
+        # Assign names by position over the speakers actually present. Indexing by the
+        # trailing number instead would hand the same name to two speakers whenever the
+        # numbering has a gap (speaker_0 takes ids[0], then unmapped speaker_2 also
+        # takes ids[0]), silently merging two people into one.
+        unique_speakers = sorted({t["speaker"] for t in concatenated if "speaker" in t},
+                                 key=_speaker_sort_key)
+        if len(unique_speakers) > len(speaker_ids):
+            print(f"Warning: {len(unique_speakers)} speakers present "
+                  f"({', '.join(map(str, unique_speakers))}) but only "
+                  f"{len(speaker_ids)} name(s) given; the rest keep their labels.")
+        for spk, name in zip(unique_speakers, speaker_ids):
+            mapping[spk] = name
 
     # Perform relabeling
     for row in concatenated:

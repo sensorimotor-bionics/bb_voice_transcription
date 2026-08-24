@@ -1,5 +1,11 @@
 import os
+## Disable logging stuff - must be set before nemo is imported to have any effect
+os.environ["NEMO_LOG_LEVEL"] = "40"
+
 import json
+import shutil
+import tempfile
+import traceback
 import torch
 import librosa
 import numpy as np
@@ -7,17 +13,12 @@ from faster_whisper import WhisperModel
 from faster_whisper.transcribe import Segment
 from pathlib import Path
 from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
-from audio_utils import prepare_audio
+from nemo.utils import logging as nemo_logging
+from audio_utils import prepare_audio, prepared_audio_path, PREPARED_AUDIO_SUFFIX
 from sklearn.cluster import AgglomerativeClustering
 from post_processing import export_transcript_by_speaker, concatenate_batch_transcripts
 
-## Disable logging stuff
-from nemo.utils import logging as nemo_logging
-os.environ["NEMO_LOG_LEVEL"] = "40"
 nemo_logging.set_verbosity(nemo_logging.ERROR)
-
-# Suffix used for the intermediate 16 kHz mono WAV that everything downstream reads.
-PREPARED_AUDIO_SUFFIX = ".16k.wav"
 
 # Cosine distance below which two speaker embeddings are taken to be the same person.
 # It applies to raw (uncentered) L2-normalized TitaNet embeddings, where same-speaker
@@ -123,23 +124,26 @@ def _diarize(diarizatrion_model: SortformerEncLabelModel,
         list[list[str]]: Speaker timings
     """
 
-    # Create the manifest config for the model - had permission issues with the default config
-    manifest_path = Path(audio_path).stem + ".json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"audio_filepath": str(audio_path),
-                            "offset": offset,
-                            "duration": audio_duration,
-                            "label": "infer",
-                            "text": "-"}) + "\n")
-    
-    # Run the diarization
-    prediction = diarizatrion_model.diarize(audio=[str(manifest_path)],
-                                            batch_size=1,
-                                            verbose=False)
+    # Create the manifest config for the model - had permission issues with the default
+    # config. It goes in a temp dir rather than the CWD so that two files with the same
+    # stem in different folders, or two runs at once, cannot clobber each other's
+    # manifest, and so a failed diarization does not leave one behind.
+    manifest_dir = tempfile.mkdtemp(prefix="diar_manifest_")
+    manifest_path = Path(manifest_dir) / (Path(audio_path).stem + ".json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"audio_filepath": str(audio_path),
+                                "offset": offset,
+                                "duration": audio_duration,
+                                "label": "infer",
+                                "text": "-"}) + "\n")
 
-    # Delete the manifest file
-    if os.path.exists(manifest_path):
-        os.remove(manifest_path)
+        # Run the diarization
+        prediction = diarizatrion_model.diarize(audio=[str(manifest_path)],
+                                                batch_size=1,
+                                                verbose=False)
+    finally:
+        shutil.rmtree(manifest_dir, ignore_errors=True)
 
     # Return the processed prediction
     return prediction # type: ignore
@@ -268,15 +272,15 @@ def get_transcript_speakers(transcript: list[dict]):
     if not transcript:
         return [], [], []
     speaker = transcript[0]['speaker']
-    num_segments = len(transcript)
-    speaker_start_times, speaker_stop_times, speakers = [0], [], [speaker]
+    # Start from the first segment's own timestamp rather than 0: the recording can
+    # open with silence, and a run's start time is where its speech starts.
+    speaker_start_times, speaker_stop_times, speakers = [transcript[0]['start']], [], [speaker]
     for i, t in enumerate(transcript):
         if t['speaker'] != speaker:
             speaker_start_times.append(t['start'])
-            if i == 0 or i == num_segments:
-                speaker_stop_times.append(t['end'])
-            else:
-                speaker_stop_times.append(transcript[i-1]['end'])
+            # i is never 0 here (the first segment defines the first speaker), so the
+            # previous segment always exists and is where the previous run ended.
+            speaker_stop_times.append(transcript[i-1]['end'])
             speaker = t['speaker']
             speakers.append(speaker)
 
@@ -327,13 +331,48 @@ def report_speaker_distances(labels: list[str],
             print(f"\t  {str(labels[i]):<{width}} <-> {str(labels[j]):<{width}}  {distance:.3f}  {verdict}")
 
 
+def _embed_segments(encoding_model: EncDecSpeakerLabelModel,
+                    audio: np.ndarray,
+                    spans: list[tuple[int, int]],
+                    device: str | torch.device,
+                    batch_size: int = 16) -> list[np.ndarray]:
+    """
+    Embed audio spans in batches, returning one L2-normalized embedding per span.
+
+    Shorter spans are zero-padded up to the longest in their batch and the true lengths
+    are passed alongside, so the encoder masks the padding out rather than treating it
+    as silence the speaker produced.
+    """
+    embeddings = []
+    for batch_start in range(0, len(spans), batch_size):
+        batch = spans[batch_start:batch_start + batch_size]
+        lengths = [stop - start for start, stop in batch]
+        padded = np.zeros((len(batch), max(lengths)), dtype=np.float32)
+        for row, (start, stop) in enumerate(batch):
+            padded[row, :stop - start] = audio[start:stop]
+
+        signal = torch.from_numpy(padded).to(device)
+        signal_lengths = torch.tensor(lengths, dtype=torch.int32).to(device)
+        with torch.no_grad():
+            _, emb = encoding_model.forward(input_signal=signal, input_signal_length=signal_lengths)
+        emb = emb.cpu().numpy()
+
+        for row in range(len(batch)):
+            norm = np.linalg.norm(emb[row])
+            if norm > 0:
+                embeddings.append(emb[row] / norm)
+
+    return embeddings
+
+
 def extract_unique_speaker_embeddings(transcript: list[dict],
                                       unique_speakers: list[str],
                                       audio: np.ndarray,
                                       encoding_model: EncDecSpeakerLabelModel,
                                       device: str | torch.device,
                                       sample_frequency: int = 16000,
-                                      center: bool = False) -> tuple[np.ndarray, list[str]]:
+                                      center: bool = False,
+                                      batch_size: int = 16) -> tuple[np.ndarray, list[str]]:
     """
     Averages per-segment speaker embeddings into one L2-normalized embedding per speaker.
     Useful as a standalone function for debugging speaker representations.
@@ -350,6 +389,7 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
             pool it was computed in: with two speakers it forces them exactly antipodal,
             and embeddings from separate calls stop being comparable at all. Leave it off
             whenever the output is compared against embeddings from another call.
+        batch_size (int): Segments embedded per forward pass.
 
     Returns:
         tuple[np.ndarray, list[str]]: (embeddings, speakers), where row i of embeddings
@@ -358,23 +398,15 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
     """
     speaker_embeddings, valid_speakers = [], []
     for spk in unique_speakers:
-        spk_segments = [t for t in transcript if t['speaker'] == spk]
-
-        seg_embeddings = []
-        for seg in spk_segments:
+        spans = []
+        for seg in (t for t in transcript if t['speaker'] == spk):
             start_idx = int(seg['start'] * sample_frequency)
             stop_idx = int(seg['end'] * sample_frequency)
             if stop_idx - start_idx < 160:  # Skip empty or sub-10ms audio slices
                 continue
-            audio_tensor = torch.tensor(audio[start_idx:stop_idx], dtype=torch.float32).unsqueeze(0).to(device)
-            audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.int32).to(device)
+            spans.append((start_idx, stop_idx))
 
-            with torch.no_grad():
-                _, emb = encoding_model.forward(input_signal=audio_tensor, input_signal_length=audio_len)
-            emb = emb.squeeze(0).cpu().numpy()
-            norm = np.linalg.norm(emb)
-            if norm > 0:
-                seg_embeddings.append(emb / norm)
+        seg_embeddings = _embed_segments(encoding_model, audio, spans, device, batch_size)
 
         # A speaker with no usable audio is dropped rather than represented by a zero
         # row: a zero row survives normalization as garbage and drags a real cluster
@@ -399,8 +431,32 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
                        distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD):
+    """
+    Group speaker embeddings by cosine distance.
+
+    Args:
+        distance_mat (np.ndarray): Square pairwise distance matrix from
+            speaker_distance_matrix().
+        num_speakers (int | None): Known speaker count, or None to decide from
+            distance_threshold.
+        distance_threshold (float): Distance at which speakers stop being merged. Also
+            used as a sanity check when num_speakers is given: if every pair is closer
+            than this, the embeddings all look like one person and no split is made,
+            since forcing one would cut a monologue into imaginary speakers.
+
+    Returns:
+        np.ndarray: Integer cluster label per row of distance_mat.
+    """
     if len(distance_mat) <= 1:
         return np.zeros(len(distance_mat), dtype=int)
+
+    if num_speakers is not None and len(distance_mat) > 1:
+        off_diagonal = distance_mat[~np.eye(len(distance_mat), dtype=bool)]
+        if off_diagonal.size and off_diagonal.max() <= distance_threshold:
+            print(f"\tAll speaker embeddings are within {distance_threshold} of each other "
+                  f"(max {off_diagonal.max():.3f}); treating them as one speaker instead of "
+                  f"forcing {num_speakers}.")
+            return np.zeros(len(distance_mat), dtype=int)
 
     if num_speakers is None:
         feature_clusterer = AgglomerativeClustering(n_clusters=None,
@@ -478,6 +534,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
                                  transcription_path: str | os.PathLike | None = None,
                                  max_audio_length: int = 600,
+                                 min_speech_duration: float = 0.5,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
                                  distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
@@ -487,6 +544,11 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  enc_model: EncDecSpeakerLabelModel | None = None):
     """
     High level function to process, transcribe, and diarize a single audio file.
+
+    Returns:
+        list[dict] | None: The transcript segments on success, an empty list if the file
+        held no speech or could not be converted, and None if the caller declined to
+        overwrite an existing transcript.
     """
     # Check that the audio path exists
     assert os.path.isfile(audio_path), f"{audio_path} is not a file"
@@ -519,9 +581,9 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     if audio_duration < 0:
         print(f"\tFailed to prepare audio for {audio_path}. Skipping.")
         if cleanup:
-            _remove_prepared_audio(audio_path.with_suffix(PREPARED_AUDIO_SUFFIX), audio_path_bk)
+            _remove_prepared_audio(prepared_audio_path(audio_path), audio_path_bk)
         return []
-    audio_path = audio_path.with_suffix(PREPARED_AUDIO_SUFFIX)
+    audio_path = prepared_audio_path(audio_path)
 
     if verbose:
         print(f"\tDuration = {audio_duration} seconds")
@@ -530,7 +592,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     print("\tInitializing transcription")
     segments = transcribe(audio_path, whisper_size, model=whisper_model)
     
-    if not detect_speech(segments):
+    if not detect_speech(segments, min_speech_duration=min_speech_duration):
         print("\tNo speech detected in audio file.")
         if cleanup:
             _remove_prepared_audio(audio_path, audio_path_bk)
@@ -632,6 +694,18 @@ def transcribe_and_diarize_folder(
         if f.is_file() and f.suffix.lower() in video_extensions
     ])
 
+    # Drop leftover 16 kHz intermediates whose source file is also here (from a run that
+    # crashed or ran with cleanup=False), so one recording is not transcribed twice.
+    sources = {f.name for f in media_files}
+    redundant = [f for f in media_files
+                 if f.name.endswith(PREPARED_AUDIO_SUFFIX)
+                 and any(f"{f.name[:-len(PREPARED_AUDIO_SUFFIX)]}{ext}" in sources
+                         for ext in video_extensions)]
+    if redundant:
+        print(f"Ignoring {len(redundant)} leftover intermediate file(s): "
+              f"{', '.join(f.name for f in redundant)}")
+        media_files = [f for f in media_files if f not in redundant]
+
     if not media_files:
         print(f"No media files with extensions {video_extensions} found in {folder_path}")
         return {"total_files": 0, "files_with_speech": 0, "files_without_speech": 0, "files": []}
@@ -644,8 +718,11 @@ def transcribe_and_diarize_folder(
     print(f"Loading models on {device} ({compute_type})...")
 
     whisper_model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
-    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").eval() # type: ignore
-    enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").eval() # type: ignore
+    diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").to(device).eval() # type: ignore
+    enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").to(device).eval() # type: ignore
+    # Read the device back off the encoder rather than trusting the string: the audio
+    # tensors have to be created wherever its weights actually ended up.
+    enc_device = next(enc_model.parameters()).device
 
     file_records = []
     all_speaker_embeddings = []
@@ -655,159 +732,195 @@ def transcribe_and_diarize_folder(
 
     for idx, file_path in enumerate(media_files, start=1):
         print(f"\n--- [{idx}/{len(media_files)}] Processing: {file_path.name} ---")
-        
-        # Prepare 16kHz WAV audio
-        wav_path = file_path.with_suffix(PREPARED_AUDIO_SUFFIX)
-        audio_duration = prepare_audio(file_path, wav_path)
+        wav_path = prepared_audio_path(file_path)
 
-        if audio_duration < 0:
-            print(f"Error processing audio for {file_path.name}. Skipping.")
+        # One unusual file shouldn't abandon a folder that may already have hours of
+        # transcription in it, so failures are recorded and the batch carries on.
+        try:
+            # Prepare 16kHz WAV audio
+            audio_duration = prepare_audio(file_path, wav_path)
+
+            if audio_duration < 0:
+                print(f"Error processing audio for {file_path.name}. Skipping.")
+                file_records.append({
+                    "file_name": file_path.name,
+                    "stem": file_path.stem,
+                    "has_speech": False,
+                    "duration": 0.0,
+                    "speaker_count": 0,
+                    "transcript": [],
+                    "speakers": [],
+                    "error": "Audio conversion failed"
+                })
+                continue
+
+            # Transcribe
+            segments = transcribe(wav_path, whisper_size=whisper_size, model=whisper_model)
+            has_speech = detect_speech(segments, min_speech_duration=min_speech_duration)
+
+            if not has_speech:
+                print(f"\tNo speech detected in {file_path.name}.")
+                file_records.append({
+                    "file_name": file_path.name,
+                    "stem": file_path.stem,
+                    "has_speech": False,
+                    "duration": audio_duration,
+                    "speaker_count": 0,
+                    "transcript": [],
+                    "speakers": []
+                })
+                continue
+
+            print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
+            speaker_times, _ = diarize_audio(diar_model, wav_path, segments, audio_duration, max_audio_length, verbose=verbose)
+            transcript = create_transcript(segments, speaker_times)
+
+            # Extract speaker embeddings for local unique speakers
+            unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
+            audio, _ = librosa.load(wav_path, sr=16000)
+
+            if verbose:
+                print(transcript)
+
+            # center=False: these embeddings are pooled with every other file's below, so
+            # they have to stay in one shared geometry rather than each file's own.
+            emb_matrix, valid_speakers = extract_unique_speaker_embeddings(
+                transcript=transcript,
+                unique_speakers=unique_speakers,
+                audio=audio,
+                encoding_model=enc_model,
+                device=enc_device,
+                sample_frequency=16000,
+                center=False
+            )
+
+            for local_spk, embedding in zip(valid_speakers, emb_matrix):
+                all_speaker_embeddings.append(embedding)
+                embedding_metadata.append({
+                    "speech_file_idx": speech_file_count,
+                    "stem": file_path.stem,
+                    "local_speaker": local_spk
+                })
+
+            skipped_speakers = [s for s in unique_speakers if s not in valid_speakers]
+            if skipped_speakers:
+                print(f"\tNo usable audio for {', '.join(skipped_speakers)}; "
+                      "keeping their local labels.")
+
             file_records.append({
                 "file_name": file_path.name,
+                "stem": file_path.stem,
+                "has_speech": True,
+                "duration": audio_duration,
+                "speech_file_idx": speech_file_count,
+                "transcript": transcript
+            })
+            speech_file_count += 1
+
+        except Exception as exc:
+            print(f"\tFAILED {file_path.name}: {type(exc).__name__}: {exc}")
+            if verbose:
+                traceback.print_exc()
+            file_records.append({
+                "file_name": file_path.name,
+                "stem": file_path.stem,
                 "has_speech": False,
                 "duration": 0.0,
                 "speaker_count": 0,
-                "error": "Audio conversion failed"
-            })
-            continue
-
-        # Transcribe
-        segments = transcribe(wav_path, whisper_size=whisper_size, model=whisper_model)
-        has_speech = detect_speech(segments, min_speech_duration=min_speech_duration)
-
-        if not has_speech:
-            print(f"\tNo speech detected in {file_path.name}.")
-            file_records.append({
-                "file_name": file_path.name,
-                "stem": file_path.stem,
-                "has_speech": False,
-                "duration": audio_duration,
-                "speaker_count": 0,
                 "transcript": [],
-                "speakers": []
+                "speakers": [],
+                "error": f"{type(exc).__name__}: {exc}"
             })
+
+        finally:
             if cleanup:
                 _remove_prepared_audio(wav_path, file_path)
-            continue
 
-        print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
-        speaker_times, _ = diarize_audio(diar_model, wav_path, segments, audio_duration, max_audio_length, verbose=verbose)
-        transcript = create_transcript(segments, speaker_times)
-
-        # Extract speaker embeddings for local unique speakers
-        unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
-        audio, _ = librosa.load(wav_path, sr=16000)
-
-        if verbose:
-            print(transcript)
-
-        # center=False: these embeddings are pooled with every other file's below, so
-        # they have to stay in one shared geometry rather than each file's own.
-        emb_matrix, valid_speakers = extract_unique_speaker_embeddings(
-            transcript=transcript,
-            unique_speakers=unique_speakers,
-            audio=audio,
-            encoding_model=enc_model,
-            device=device,
-            sample_frequency=16000,
-            center=False
-        )
-
-        for local_spk, embedding in zip(valid_speakers, emb_matrix):
-            all_speaker_embeddings.append(embedding)
-            embedding_metadata.append({
-                "speech_file_idx": speech_file_count,
-                "stem": file_path.stem,
-                "local_speaker": local_spk
-            })
-
-        skipped_speakers = [s for s in unique_speakers if s not in valid_speakers]
-        if skipped_speakers:
-            print(f"\tNo usable audio for {', '.join(skipped_speakers)}; "
-                  "keeping their local labels.")
-
-        file_records.append({
-            "file_name": file_path.name,
-            "stem": file_path.stem,
-            "has_speech": True,
-            "duration": audio_duration,
-            "speech_file_idx": speech_file_count,
-            "transcript": transcript
-        })
-        speech_file_count += 1
-
-        if cleanup:
-            _remove_prepared_audio(wav_path, file_path)
-
-    # Perform global speaker classification across all speech files
+    # Perform global speaker classification across all speech files. Clustering is kept
+    # separate from exporting: if there is nothing to cluster, or the clustering itself
+    # fails, transcripts are still written with their per-file labels rather than the
+    # whole folder's transcription work being discarded.
+    file_spk_mappings = {}
     if all_speaker_embeddings:
         print(f"\nRunning cross-file speaker clustering across {len(all_speaker_embeddings)} local speaker representation(s)...")
-        global_matrix = np.vstack(all_speaker_embeddings)
-        distance_mat = speaker_distance_matrix(global_matrix)
+        try:
+            global_matrix = np.vstack(all_speaker_embeddings)
+            distance_mat = speaker_distance_matrix(global_matrix)
 
-        if verbose:
-            report_speaker_distances([f"{m['stem']}:{m['local_speaker']}" for m in embedding_metadata],
-                                     distance_mat,
-                                     distance_threshold)
+            if verbose:
+                report_speaker_distances([f"{m['stem']}:{m['local_speaker']}" for m in embedding_metadata],
+                                         distance_mat,
+                                         distance_threshold)
 
-        global_labels = cluster_embeddings(distance_mat,
-                                           num_speakers=global_num_speakers,
-                                           distance_threshold=distance_threshold)
-        if global_num_speakers is None:
-            print(f"\tFound {len(set(global_labels))} global speaker(s) "
-                  f"at distance_threshold={distance_threshold}")
-        else:
-            print(f"\tSplit into {len(set(global_labels))} global speaker(s) as requested")
+            global_labels = cluster_embeddings(distance_mat,
+                                               num_speakers=global_num_speakers,
+                                               distance_threshold=distance_threshold)
+            if global_num_speakers is None:
+                print(f"\tFound {len(set(global_labels))} global speaker(s) "
+                      f"at distance_threshold={distance_threshold}")
+            else:
+                print(f"\tSplit into {len(set(global_labels))} global speaker(s) as requested")
 
-        # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
-        file_spk_mappings = {}
-        for meta, g_label in zip(embedding_metadata, global_labels):
-            sf_idx = meta["speech_file_idx"]
-            loc_spk = meta["local_speaker"]
-            if sf_idx not in file_spk_mappings:
-                file_spk_mappings[sf_idx] = {}
-            file_spk_mappings[sf_idx][loc_spk] = f"speaker_{g_label}"
+            # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
+            for meta, g_label in zip(embedding_metadata, global_labels):
+                sf_idx = meta["speech_file_idx"]
+                loc_spk = meta["local_speaker"]
+                if sf_idx not in file_spk_mappings:
+                    file_spk_mappings[sf_idx] = {}
+                file_spk_mappings[sf_idx][loc_spk] = f"speaker_{g_label}"
+        except Exception as exc:
+            print(f"\tCross-file speaker clustering failed ({type(exc).__name__}: {exc}); "
+                  "keeping per-file speaker labels.")
+            file_spk_mappings = {}
+    else:
+        print("\nNo speaker embeddings to cluster; keeping per-file speaker labels.")
 
-        # Remap transcripts and export files
-        for rec in file_records:
-            if not rec.get("has_speech", False):
-                continue
-            sf_idx = rec["speech_file_idx"]
-            spk_map = file_spk_mappings.get(sf_idx, {})
-            
-            # Key off local_speaker, not speaker, so the remap stays correct even if
-            # a global label collides with a local one (both are "speaker_<n>").
-            for t in rec["transcript"]:
-                t.setdefault("local_speaker", t["speaker"])
-                t["speaker"] = spk_map.get(t["local_speaker"], t["speaker"])
+    # Remap transcripts and export files
+    for rec in file_records:
+        if not rec.get("has_speech", False):
+            continue
+        spk_map = file_spk_mappings.get(rec["speech_file_idx"], {})
 
+        # Key off local_speaker, not speaker, so the remap stays correct even if
+        # a global label collides with a local one (both are "speaker_<n>").
+        for t in rec["transcript"]:
+            t.setdefault("local_speaker", t["speaker"])
+            t["speaker"] = spk_map.get(t["local_speaker"], t["speaker"])
 
-            # Update speakers present list
-            rec["speakers"] = sorted(list(set(t["speaker"] for t in rec["transcript"])))
-            rec["speaker_count"] = len(rec["speakers"])
+        # Update speakers present list
+        rec["speakers"] = sorted(list(set(t["speaker"] for t in rec["transcript"])))
+        rec["speaker_count"] = len(rec["speakers"])
 
-            # Save txt transcript
-            txt_out = output_dir / f"{rec['stem']}_transcript.txt"
-            export_transcript_by_speaker(rec["transcript"], txt_out)
+        # Save txt transcript
+        txt_out = output_dir / f"{rec['stem']}_transcript.txt"
+        export_transcript_by_speaker(rec["transcript"], txt_out)
 
-            # Save json transcript
-            json_out = output_dir / f"{rec['stem']}_transcript.json"
-            with open(json_out, "w", encoding="utf-8") as f:
-                f.write(json.dumps(rec["transcript"], indent=4) + "\n")
-            
-            print(f"\tSaved global transcript for {rec['file_name']} -> {txt_out.name}")
+        # Save json transcript
+        json_out = output_dir / f"{rec['stem']}_transcript.json"
+        with open(json_out, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec["transcript"], indent=4) + "\n")
+
+        print(f"\tSaved transcript for {rec['file_name']} -> {txt_out.name}")
 
     summary = {
         "total_files": len(media_files),
         "files_with_speech": speech_file_count,
         "files_without_speech": len(media_files) - speech_file_count,
+        "output_dir": str(output_dir),
         "files": file_records,
     }
 
-    # Dump concatenated summary JSON
+    # Dump the summary, pointing at each per-file transcript instead of repeating it.
+    # concatenate_batch_transcripts follows "transcript_file" when it reads this back.
     summary_path = output_dir / "batch_summary.json"
+    disk_summary = dict(summary)
+    disk_summary["files"] = [
+        {**{k: v for k, v in rec.items() if k != "transcript"},
+         **({"transcript_file": f"{rec['stem']}_transcript.json"} if rec.get("has_speech") else {})}
+        for rec in file_records
+    ]
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=4)
+        json.dump(disk_summary, f, indent=4)
 
     print(f"\tSaved batch summary to {summary_path}")
     # Dump concatenated transcript

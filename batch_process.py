@@ -14,6 +14,10 @@ def main():
     parser.add_argument("--distance_threshold", type=float, default=DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                         help="Cosine distance below which two local speakers are merged (unused if --global_num_speakers is set)")
     parser.add_argument("--min_speech_duration", type=float, default=0.5, help="Minimum seconds of speech required per file")
+    parser.add_argument("--max_audio_length", type=int, default=600,
+                        help="Diarize in chunks once a file is longer than this many seconds")
+    parser.add_argument("--no_cleanup", action="store_true",
+                        help="Keep the intermediate 16 kHz WAV files instead of deleting them")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging during processing")
 
     args = parser.parse_args()
@@ -31,6 +35,8 @@ def main():
         global_num_speakers=args.global_num_speakers,
         distance_threshold=args.distance_threshold,
         min_speech_duration=args.min_speech_duration,
+        max_audio_length=args.max_audio_length,
+        cleanup=not args.no_cleanup,
         verbose=args.verbose
     )
     print(summary)
