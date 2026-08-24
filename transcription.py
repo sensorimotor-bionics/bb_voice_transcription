@@ -430,7 +430,8 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
 
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
-                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD):
+                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                       collapse_uniform: bool = False):
     """
     Group speaker embeddings by cosine distance.
 
@@ -438,25 +439,23 @@ def cluster_embeddings(distance_mat: np.ndarray,
         distance_mat (np.ndarray): Square pairwise distance matrix from
             speaker_distance_matrix().
         num_speakers (int | None): Known speaker count, or None to decide from
-            distance_threshold.
-        distance_threshold (float): Distance at which speakers stop being merged. Also
-            used as a sanity check when num_speakers is given: if every pair is closer
-            than this, the embeddings all look like one person and no split is made,
-            since forcing one would cut a monologue into imaginary speakers.
+            distance_threshold. An explicit count is always honoured: it comes from the
+            caller knowing the recording, which beats anything inferred from distances.
+        distance_threshold (float): Distance at which speakers stop being merged when
+            num_speakers is None. When a count is given it is only used to notice that
+            every embedding looks alike and say so.
+        collapse_uniform (bool): When a count is given but every pair is closer than
+            distance_threshold, return a single speaker instead of the requested split.
+            Off by default: with one file the "speakers" being compared are the same
+            people re-embedded per diarization chunk, and two genuinely different but
+            similar voices routinely sit under the threshold, so overriding the caller
+            there turns a correct two-speaker transcript into a single-speaker one.
 
     Returns:
         np.ndarray: Integer cluster label per row of distance_mat.
     """
     if len(distance_mat) <= 1:
         return np.zeros(len(distance_mat), dtype=int)
-
-    if num_speakers is not None and len(distance_mat) > 1:
-        off_diagonal = distance_mat[~np.eye(len(distance_mat), dtype=bool)]
-        if off_diagonal.size and off_diagonal.max() <= distance_threshold:
-            print(f"\tAll speaker embeddings are within {distance_threshold} of each other "
-                  f"(max {off_diagonal.max():.3f}); treating them as one speaker instead of "
-                  f"forcing {num_speakers}.")
-            return np.zeros(len(distance_mat), dtype=int)
 
     if num_speakers is None:
         feature_clusterer = AgglomerativeClustering(n_clusters=None,
@@ -472,6 +471,19 @@ def cluster_embeddings(distance_mat: np.ndarray,
             raise ValueError(f"num_speakers must be an integer or None, got {num_speakers!r}")
         if n_clusters != num_speakers or n_clusters < 1:
             raise ValueError(f"num_speakers must be a positive integer or None, got {num_speakers!r}")
+
+        off_diagonal = distance_mat[~np.eye(len(distance_mat), dtype=bool)]
+        if n_clusters > 1 and off_diagonal.size and off_diagonal.max() <= distance_threshold:
+            print(f"\tNote: every speaker embedding is within {distance_threshold} of the others "
+                  f"(max {off_diagonal.max():.3f}), so the voices are hard for the encoder to "
+                  f"tell apart.")
+            if collapse_uniform:
+                print(f"\tcollapse_uniform is set, so treating them as one speaker rather than "
+                      f"splitting into {n_clusters}.")
+                return np.zeros(len(distance_mat), dtype=int)
+            print(f"\tSplitting into {n_clusters} as asked. If the result looks like one person "
+                  f"split in two, rerun without a speaker count to let the distances decide.")
+
         feature_clusterer = AgglomerativeClustering(n_clusters=min(n_clusters, len(distance_mat)),
                                                     metric='precomputed',
                                                     linkage='average')

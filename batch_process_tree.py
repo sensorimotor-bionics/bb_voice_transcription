@@ -60,10 +60,12 @@ def main():
     parser.add_argument("--whisper_size", type=str, default="small",
                         choices=["tiny", "base", "small", "medium", "large-v3"], help="Whisper model size")
     parser.add_argument("--global_num_speakers", type=int, default=None,
-                        help="Known number of global speakers within each subfolder (optional)")
+                        help="Known number of global speakers within each subfolder (optional). "
+                             "When given it is honoured exactly, including for a single long file "
+                             "whose speakers are diarized in chunks")
     parser.add_argument("--distance_threshold", type=float, default=DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
-                        help="Cosine distance below which two local speakers are merged "
-                             "(unused if --global_num_speakers is set)")
+                        help="Cosine distance below which two local speakers are merged when "
+                             "--global_num_speakers is not given")
     parser.add_argument("--min_speech_duration", type=float, default=0.5,
                         help="Minimum seconds of speech required per file")
     parser.add_argument("--max_audio_length", type=int, default=600,
@@ -99,6 +101,7 @@ def main():
 
     pending, skipped = [], []
     for folder in subfolders:
+        print(f"\tChecking {folder.name} ...")
         if is_already_processed(folder) and not args.force:
             skipped.append((folder, "already has transcripts"))
         elif not has_media(folder, MEDIA_EXTENSIONS):
