@@ -9,12 +9,31 @@ from pathlib import Path
 from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
 from audio_utils import prepare_audio
 from sklearn.cluster import AgglomerativeClustering
-from post_processing import export_transcript_by_speaker
+from post_processing import export_transcript_by_speaker, concatenate_batch_transcripts
 
 ## Disable logging stuff
 from nemo.utils import logging as nemo_logging
 os.environ["NEMO_LOG_LEVEL"] = "40"
 nemo_logging.set_verbosity(nemo_logging.ERROR)
+
+# Suffix used for the intermediate 16 kHz mono WAV that everything downstream reads.
+PREPARED_AUDIO_SUFFIX = ".16k.wav"
+
+
+def _remove_prepared_audio(prepared_path: os.PathLike, original_path: os.PathLike) -> None:
+    """
+    Delete an intermediate 16 kHz WAV, without ever deleting the caller's input file.
+
+    Path.suffix only ever returns the final suffix (".wav"), so the ".16k.wav" test
+    has to be done against the full file name.
+    """
+    prepared_path, original_path = Path(prepared_path), Path(original_path)
+    if prepared_path == original_path:
+        return
+    if not prepared_path.name.endswith(PREPARED_AUDIO_SUFFIX):
+        return
+    if prepared_path.exists():
+        os.remove(prepared_path)
 
 
 def transcribe(audio_path: os.PathLike,
@@ -122,7 +141,8 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
                   audio_path: os.PathLike,
                   segments: list[Segment],
                   audio_duration: int | float,
-                  max_audio_length: int | float = 600, 
+                  max_audio_length: int | float = 600,
+                  min_chunk_gap: float = 1.0,
                   verbose: bool = False):
 
     # Determine if we can fit the audio in the available memory
@@ -148,25 +168,38 @@ def diarize_audio(diar_model: SortformerEncLabelModel,
             if verbose:
                 print(f"\t- Chunk {chunk_counter}: {start_time:0.1f}-{stop_time:0.1f}")
 
+            # Every remaining segment, so the chunk always starts on real speech
+            remaining_idx = np.where(segment_times[:,0] > start_time)[0]
+            if len(remaining_idx) == 0:
+                break
+            start_idx = remaining_idx[0]
+
             # Check that we don't leave a section at the end hanging
             if (audio_duration - start_time) < max_audio_length:
-                sub_seg_idx = np.where((segment_times[:,0] > start_time))[0]
-                start_idx = sub_seg_idx[0]
-                stop_idx = -1
+                stop_idx = len(segments) - 1
             else:
-                # Find the indices of the segments in the range of the start and stop time
-                sub_seg_idx = np.where(((segment_times[:,0] > start_time) & 
-                                        (segment_times[:,1] < stop_time) & 
-                                        (segment_times[:,2] > 1)))[0]
+                # Prefer to end the chunk on a segment preceded by a real pause so
+                # boundaries land in silence rather than mid-utterance.
+                in_window = remaining_idx[segment_times[remaining_idx,1] < stop_time]
+                gap_idx = in_window[segment_times[in_window,2] > min_chunk_gap]
+                if len(gap_idx) > 0:
+                    stop_idx = gap_idx[-1]
+                elif len(in_window) > 0:
+                    # Continuous speech with no pause over min_chunk_gap in this
+                    # window: fill the chunk instead of cutting it short.
+                    stop_idx = in_window[-1]
+                else:
+                    # A single segment spans the whole window; keep it intact.
+                    stop_idx = start_idx
+                stop_idx = max(stop_idx, start_idx)
 
-                start_idx = sub_seg_idx[0]
-                stop_idx = sub_seg_idx[-1]
-            
-            # Diarize audio chunk
+            # Diarize audio chunk, padding 0.1s either side without running off the file
+            chunk_start = max(0.0, segment_times[start_idx,0] - 0.1)
+            chunk_stop = min(float(audio_duration), segment_times[stop_idx,1] + 0.1)
             diar_prediction = _diarize(diar_model,
                                       audio_path,
-                                      segment_times[start_idx,0] - 0.1,
-                                      segment_times[stop_idx,1] - segment_times[start_idx,0] + 0.2)
+                                      chunk_start,
+                                      chunk_stop - chunk_start)
             speaker_times += format_diarization(diar_prediction[0], chunk_counter*10) # Append speaker times for the chunk
 
             # Update 
@@ -210,11 +243,15 @@ def create_transcript(segments: list[Segment],
     """
     transcript = []
     for s in segments:
+        # Diarization labels are per-file, so this is the local speaker. Callers that
+        # remap to global labels overwrite "speaker" and leave "local_speaker" intact.
+        speaker = assign_speaker(s, speaker_times)
         transcript.append({"start": s.start,
                            "end": s.end,
-                           "speaker": assign_speaker(s, speaker_times),
+                           "speaker": speaker,
+                           "local_speaker": speaker,
                            "text": s.text.strip()})
-    
+
     return transcript
 
 
@@ -357,7 +394,7 @@ def post_hoc_diarization(transcript: list[dict],
 
 def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  whisper_size: str = "small",
-                                 transcription_path: str | None = None,
+                                 transcription_path: str | os.PathLike | None = None,
                                  max_audio_length: int = 600,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
@@ -383,16 +420,25 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     else:
         if not isinstance(transcription_path, (str, bytes, os.PathLike)):
             raise TypeError("transcription_path must be a PathLike")
-        # Check if the path exists
-        if os.path.exists(transcription_path):
-            user_input = input(f"{transcription_path}. Do you want to overwrite? (y/n): ").strip().lower()
+        transcription_path = Path(os.fsdecode(transcription_path))
+        # Check the files we are actually about to write, not the extension-less base
+        existing = [p for p in (transcription_path.with_suffix(".txt"),
+                                transcription_path.with_suffix(".json")) if p.exists()]
+        if existing:
+            existing_str = ", ".join(str(p) for p in existing)
+            user_input = input(f"{existing_str} already exists. Do you want to overwrite? (y/n): ").strip().lower()
             if user_input not in ('y', 'yes'):
-                return
+                return None
     print(f"Processing {audio_path}")
 
     ### Pre-format audio file for quicker processing
     audio_duration = prepare_audio(audio_path)
-    audio_path = audio_path.with_suffix(".16k.wav")
+    if audio_duration < 0:
+        print(f"\tFailed to prepare audio for {audio_path}. Skipping.")
+        if cleanup:
+            _remove_prepared_audio(audio_path.with_suffix(PREPARED_AUDIO_SUFFIX), audio_path_bk)
+        return []
+    audio_path = audio_path.with_suffix(PREPARED_AUDIO_SUFFIX)
 
     if verbose:
         print(f"\tDuration = {audio_duration} seconds")
@@ -403,8 +449,8 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     
     if not detect_speech(segments):
         print("\tNo speech detected in audio file.")
-        if cleanup and os.path.exists(audio_path) and audio_path.suffix == ".16k.wav" and audio_path_bk != audio_path:
-            os.remove(audio_path)
+        if cleanup:
+            _remove_prepared_audio(audio_path, audio_path_bk)
         return []
 
     ### NeMo diarization
@@ -437,8 +483,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
     print("\tSaved transcript to", out_path)
 
     if cleanup:
-        if (os.path.exists(audio_path) and audio_path.suffix == ".16k.wav" and audio_path_bk != audio_path):
-            os.remove(audio_path)
+        _remove_prepared_audio(audio_path, audio_path_bk)
 
     return transcript
 
@@ -521,7 +566,7 @@ def transcribe_and_diarize_folder(
         print(f"\n--- [{idx}/{len(media_files)}] Processing: {file_path.name} ---")
         
         # Prepare 16kHz WAV audio
-        wav_path = file_path.with_suffix(".16k.wav")
+        wav_path = file_path.with_suffix(PREPARED_AUDIO_SUFFIX)
         audio_duration = prepare_audio(file_path, wav_path)
 
         if audio_duration < 0:
@@ -550,8 +595,8 @@ def transcribe_and_diarize_folder(
                 "transcript": [],
                 "speakers": []
             })
-            if cleanup and os.path.exists(wav_path) and wav_path != file_path:
-                os.remove(wav_path)
+            if cleanup:
+                _remove_prepared_audio(wav_path, file_path)
             continue
 
         print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
@@ -562,7 +607,8 @@ def transcribe_and_diarize_folder(
         unique_speakers = list(dict.fromkeys(t['speaker'] for t in transcript))
         audio, _ = librosa.load(wav_path, sr=16000)
 
-        print(transcript)
+        if verbose:
+            print(transcript)
 
         emb_matrix = extract_unique_speaker_embeddings(
             transcript=transcript,
@@ -587,13 +633,12 @@ def transcribe_and_diarize_folder(
             "has_speech": True,
             "duration": audio_duration,
             "speech_file_idx": speech_file_count,
-            "local_speakers": unique_speakers,
             "transcript": transcript
         })
         speech_file_count += 1
 
-        if cleanup and os.path.exists(wav_path) and wav_path != file_path:
-            os.remove(wav_path)
+        if cleanup:
+            _remove_prepared_audio(wav_path, file_path)
 
     # Perform global speaker classification across all speech files
     if all_speaker_embeddings:
@@ -609,7 +654,9 @@ def transcribe_and_diarize_folder(
         similarity_mat = np.dot(global_matrix, global_matrix.T)
         distance_mat = np.clip(1.0 - similarity_mat, 0.0, 2.0)
 
-        global_labels = cluster_embeddings(distance_mat, num_speakers=global_num_speakers, distance_threshold=distance_threshold)
+        global_labels = cluster_embeddings(distance_mat,
+                                           num_speakers=global_num_speakers,
+                                           distance_threshold=distance_threshold)
 
         # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
         file_spk_mappings = {}
@@ -627,9 +674,13 @@ def transcribe_and_diarize_folder(
             sf_idx = rec["speech_file_idx"]
             spk_map = file_spk_mappings.get(sf_idx, {})
             
+            # Key off local_speaker, not speaker, so the remap stays correct even if
+            # a global label collides with a local one (both are "speaker_<n>").
             for t in rec["transcript"]:
-                t["speaker"] = spk_map.get(t["speaker"], t["speaker"])
-            
+                t.setdefault("local_speaker", t["speaker"])
+                t["speaker"] = spk_map.get(t["local_speaker"], t["speaker"])
+
+
             # Update speakers present list
             rec["speakers"] = sorted(list(set(t["speaker"] for t in rec["transcript"])))
             rec["speaker_count"] = len(rec["speakers"])
@@ -650,13 +701,16 @@ def transcribe_and_diarize_folder(
         "files_with_speech": speech_file_count,
         "files_without_speech": len(media_files) - speech_file_count,
         "files": file_records,
-        "output_dir": str(output_dir)
     }
 
+    # Dump concatenated summary JSON
     summary_path = output_dir / "batch_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=4)
 
-    print(f"\tSaved batch summary to {summary_path.name}")
+    print(f"\tSaved batch summary to {summary_path}")
+    # Dump concatenated transcript
+    concatenate_batch_transcripts(summary, output_path=output_dir)
+
     print("Batch processing complete!")
     return summary
