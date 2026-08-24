@@ -1,4 +1,4 @@
-name: bb_voice_transcription
+name: voice_transcription
 channels:
   - conda-forge
 dependencies:
@@ -6,10 +6,14 @@ dependencies:
   - pip
   - ipykernel
   - pip:
+    # PyPI's default torch wheel is CPU-only on Windows; pull the CUDA build
+    # explicitly. cu128 covers Blackwell (sm_120) and, unlike cu130, ships the
+    # CUDA 12 cuBLAS that CTranslate2 (faster-whisper) links against.
+    - --extra-index-url https://download.pytorch.org/whl/cu128
     - faster_whisper
     - nemo_toolkit[asr]
     - pydub
-    - torch
+    - torch==2.11.0+cu128
     - scikit-learn
     - numpy
     - librosa
