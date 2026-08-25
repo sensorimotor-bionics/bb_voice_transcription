@@ -236,7 +236,7 @@ def assign_speaker(segment: Segment,
     votes = {}
     # For each word in the segment
     for w in (segment.words or []): # type: ignore
-        # Check 
+        # Check
         best, best_overlap = "unknown", 0.0
         for t in speaker_turns:
             overlap = max(0.0, min(w.end, t["end"]) - max(w.start, t["start"]))
@@ -430,8 +430,7 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
 
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
-                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
-                       collapse_uniform: bool = False):
+                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD):
     """
     Group speaker embeddings by cosine distance.
 
@@ -442,14 +441,7 @@ def cluster_embeddings(distance_mat: np.ndarray,
             distance_threshold. An explicit count is always honoured: it comes from the
             caller knowing the recording, which beats anything inferred from distances.
         distance_threshold (float): Distance at which speakers stop being merged when
-            num_speakers is None. When a count is given it is only used to notice that
-            every embedding looks alike and say so.
-        collapse_uniform (bool): When a count is given but every pair is closer than
-            distance_threshold, return a single speaker instead of the requested split.
-            Off by default: with one file the "speakers" being compared are the same
-            people re-embedded per diarization chunk, and two genuinely different but
-            similar voices routinely sit under the threshold, so overriding the caller
-            there turns a correct two-speaker transcript into a single-speaker one.
+            num_speakers is None.
 
     Returns:
         np.ndarray: Integer cluster label per row of distance_mat.
@@ -462,31 +454,13 @@ def cluster_embeddings(distance_mat: np.ndarray,
                                                     metric='precomputed',
                                                     linkage='average',
                                                     distance_threshold=distance_threshold)
-    else:
-        # Accept anything integral (including numpy ints) but reject 2.5 or "two"
-        # rather than silently truncating or leaving the clusterer undefined.
-        try:
-            n_clusters = int(num_speakers)
-        except (TypeError, ValueError):
-            raise ValueError(f"num_speakers must be an integer or None, got {num_speakers!r}")
-        if n_clusters != num_speakers or n_clusters < 1:
-            raise ValueError(f"num_speakers must be a positive integer or None, got {num_speakers!r}")
-
-        off_diagonal = distance_mat[~np.eye(len(distance_mat), dtype=bool)]
-        if n_clusters > 1 and off_diagonal.size and off_diagonal.max() <= distance_threshold:
-            print(f"\tNote: every speaker embedding is within {distance_threshold} of the others "
-                  f"(max {off_diagonal.max():.3f}), so the voices are hard for the encoder to "
-                  f"tell apart.")
-            if collapse_uniform:
-                print(f"\tcollapse_uniform is set, so treating them as one speaker rather than "
-                      f"splitting into {n_clusters}.")
-                return np.zeros(len(distance_mat), dtype=int)
-            print(f"\tSplitting into {n_clusters} as asked. If the result looks like one person "
-                  f"split in two, rerun without a speaker count to let the distances decide.")
-
-        feature_clusterer = AgglomerativeClustering(n_clusters=min(n_clusters, len(distance_mat)),
+    elif isinstance(num_speakers, int) and num_speakers > 0:
+        feature_clusterer = AgglomerativeClustering(n_clusters=num_speakers,
                                                     metric='precomputed',
                                                     linkage='average')
+
+    else:
+        raise ValueError(f"num_speakers must be a positive integer or None, got {num_speakers}")
 
     return feature_clusterer.fit_predict(distance_mat)
 
