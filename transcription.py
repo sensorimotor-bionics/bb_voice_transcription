@@ -29,6 +29,15 @@ nemo_logging.set_verbosity(nemo_logging.ERROR)
 # when the speaker count is unknown; passing num_speakers/global_num_speakers ignores it.
 DEFAULT_SPEAKER_DISTANCE_THRESHOLD = 0.35
 
+# Speech a local speaker needs before it may define a speaker of its own. Below roughly
+# ten seconds the averaged embedding is dominated by whatever the encoder made of a
+# couple of short segments, and such a row otherwise consumes a whole cluster.
+MIN_SPEAKER_SPEECH_SECONDS = 10.0
+
+# assign_speaker's label for words that overlapped no diarization turn. It is a residue
+# of unmatched words rather than a person, so it never defines a speaker.
+UNKNOWN_SPEAKER = "unknown"
+
 
 def _remove_prepared_audio(prepared_path: os.PathLike, original_path: os.PathLike) -> None:
     """
@@ -496,6 +505,96 @@ def cluster_embeddings(distance_mat: np.ndarray,
     return feature_clusterer.fit_predict(distance_mat)
 
 
+def speaker_weights(transcript: list[dict], speakers: list[str]) -> np.ndarray:
+    """
+    Seconds of transcript behind each of `speakers`, for use as clustering weights.
+
+    UNKNOWN_SPEAKER is weighted 0 so it is never allowed to define a speaker.
+    """
+    totals: dict[str, float] = {}
+    for t in transcript:
+        label = t.get("local_speaker", t["speaker"])
+        totals[label] = totals.get(label, 0.0) + (t["end"] - t["start"])
+    return np.array([0.0 if s == UNKNOWN_SPEAKER else totals.get(s, 0.0) for s in speakers])
+
+
+def voting_rows(weights: np.ndarray,
+                min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS) -> list[int]:
+    """Row indices carrying enough speech to place a cluster boundary."""
+    weights = np.asarray(weights, dtype=float)
+    return [i for i in range(len(weights))
+            if weights[i] >= max(min_speaker_speech, 1e-9)]
+
+
+def cluster_local_speakers(embeddings: np.ndarray,
+                           weights: np.ndarray,
+                           num_speakers: int | None = None,
+                           distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                           min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                           linkage: str = "average",
+                           announce: bool = True,
+                           verbose: bool = False) -> np.ndarray:
+    """
+    Cluster local speakers, letting only the well-supported ones place the boundaries.
+
+    Chunked diarization renames the same people in every chunk, so a long recording
+    arrives here as many local speakers that mostly need merging back together. A local
+    speaker holding a few seconds of speech has an unreliable embedding that sits far
+    from everyone, and it costs a whole cluster: on a 36 minute recording, asking for two
+    speakers put 1847s in one cluster and a 4-second fragment in the other. Holding those
+    rows out and attaching them afterwards to the nearest cluster gives 1323s / 528s.
+
+    Args:
+        embeddings (np.ndarray): L2-normalized embeddings, one row per local speaker.
+        weights (np.ndarray): Seconds of speech behind each row. A row weighted 0 never
+            defines a cluster, which is how the "unknown" bucket is kept out.
+        num_speakers (int | None): Known speaker count, applied to the rows that cluster.
+        distance_threshold (float): Merge distance when num_speakers is None.
+        min_speaker_speech (float): Speech a row needs to define a cluster. Set to 0 to
+            let every row take part.
+        linkage (str): Passed to cluster_embeddings.
+        verbose (bool): Report each held-out row and what it was attached to.
+
+    Returns:
+        np.ndarray: Cluster label per input row.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if len(embeddings) <= 1:
+        return np.zeros(len(embeddings), dtype=int)
+
+    voting = voting_rows(weights, min_speaker_speech)
+    held_out = [i for i in range(len(embeddings)) if i not in set(voting)]
+    if len(voting) < 2:
+        # Nothing solid to cluster around; fall back to using every row
+        voting, held_out = list(range(len(embeddings))), []
+
+    # Holding rows out can leave fewer speakers than the caller asked for, and asking a
+    # tree with 4 leaves for 5 clusters is an error rather than a judgement call.
+    wanted = num_speakers
+    if isinstance(wanted, (int, np.integer)) and wanted > len(voting):
+        wanted = len(voting)
+
+    voting_emb = embeddings[voting]
+    labels = cluster_embeddings(speaker_distance_matrix(voting_emb), wanted,
+                               distance_threshold, linkage=linkage, embeddings=voting_emb)
+
+    full = np.empty(len(embeddings), dtype=int)
+    full[voting] = labels
+    if held_out:
+        centroids = cluster_centroids(voting_emb, labels, weights[voting])
+        if announce:
+            print(f"\t{len(held_out)} local speaker(s) under {min_speaker_speech}s of speech "
+                  "attached to the nearest speaker rather than defining their own.")
+        for i in held_out:
+            full[i] = min(centroids,
+                          key=lambda lab: 1.0 - float(np.dot(embeddings[i], centroids[lab])))
+            if verbose:
+                gap = 1.0 - float(np.dot(embeddings[i], centroids[full[i]]))
+                print(f"\t  row {i} ({weights[i]:.1f}s) -> cluster {full[i]} at distance {gap:.3f}")
+    return full
+
+
 def cluster_centroids(embeddings: np.ndarray,
                       labels: np.ndarray,
                       weights: np.ndarray | None = None) -> dict[int, np.ndarray]:
@@ -697,6 +796,7 @@ def post_hoc_diarization(transcript: list[dict],
                          num_speakers: int | None = None,
                          enc_model: EncDecSpeakerLabelModel | None = None,
                          distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                         min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
                          verbose: bool = False):
 
     # Identify all unique chunk-level speakers in the transcript
@@ -725,10 +825,17 @@ def post_hoc_diarization(transcript: list[dict],
         return transcript
 
     # Cluster chunk speakers into global speaker IDs
-    distance_mat = speaker_distance_matrix(embedding_matrix)
     if verbose:
-        report_speaker_distances(valid_speakers, distance_mat, distance_threshold)
-    speaker_labels = cluster_embeddings(distance_mat, num_speakers, distance_threshold)
+        report_speaker_distances(valid_speakers, speaker_distance_matrix(embedding_matrix),
+                                 distance_threshold)
+
+    weights = speaker_weights(transcript, valid_speakers)
+    speaker_labels = cluster_local_speakers(embedding_matrix,
+                                            weights,
+                                            num_speakers,
+                                            distance_threshold,
+                                            min_speaker_speech=min_speaker_speech,
+                                            verbose=verbose)
 
     # Create mapping dict (e.g. {'speaker_10': 'speaker_0', 'speaker_20': 'speaker_0'})
     spk_to_global = {spk: f"speaker_{label}" for spk, label in zip(valid_speakers, speaker_labels)}
@@ -757,6 +864,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  verbose: bool = False,
                                  num_speakers: int | None = 2,
                                  distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                                 min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
                                  cleanup: bool = True,
                                  whisper_model: WhisperModel | None = None,
                                  diar_model: SortformerEncLabelModel | None = None,
@@ -839,6 +947,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                           num_speakers,
                                           enc_model=enc_model,
                                           distance_threshold=distance_threshold,
+                                          min_speaker_speech=min_speaker_speech,
                                           verbose=verbose)
 
     # Dump the transcript as .txt
@@ -866,6 +975,7 @@ def transcribe_and_diarize_folder(
     min_speech_duration: float = 0.5,
     global_num_speakers: int | None = None,
     distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+    min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
     verbose: bool = False,
     cleanup: bool = True
 ) -> dict:
@@ -888,6 +998,8 @@ def transcribe_and_diarize_folder(
             merged into one global speaker. Only used when global_num_speakers is None;
             see DEFAULT_SPEAKER_DISTANCE_THRESHOLD, and pass verbose=True to print the
             pairwise distances it is compared against.
+        min_speaker_speech (float): A local speaker with less assigned speech than this is
+            attached to the nearest global speaker rather than defining one of its own.
         verbose (bool): Extra logging.
         cleanup (bool): Automatically remove intermediate 16k WAV files.
 
@@ -1069,9 +1181,21 @@ def transcribe_and_diarize_folder(
                                          distance_mat,
                                          distance_threshold)
 
-            global_labels = cluster_embeddings(distance_mat,
-                                               num_speakers=global_num_speakers,
-                                               distance_threshold=distance_threshold)
+            # Seconds behind each pooled row, so a local speaker holding a couple of
+            # seconds cannot claim a global speaker of its own.
+            speech_by_file = {rec["speech_file_idx"]: rec["transcript"]
+                              for rec in file_records if rec.get("has_speech", False)}
+            pool_weights = np.array([
+                speaker_weights(speech_by_file.get(m["speech_file_idx"], []),
+                                [m["local_speaker"]])[0]
+                for m in embedding_metadata])
+
+            global_labels = cluster_local_speakers(global_matrix,
+                                                   pool_weights,
+                                                   num_speakers=global_num_speakers,
+                                                   distance_threshold=distance_threshold,
+                                                   min_speaker_speech=min_speaker_speech,
+                                                   verbose=verbose)
             if global_num_speakers is None:
                 print(f"\tFound {len(set(global_labels))} global speaker(s) "
                       f"at distance_threshold={distance_threshold}")

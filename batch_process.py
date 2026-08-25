@@ -1,7 +1,8 @@
 import argparse
 import sys
 from pathlib import Path
-from transcription import transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD
+from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                           MIN_SPEAKER_SPEECH_SECONDS)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -16,6 +17,8 @@ def main():
     parser.add_argument("--min_speech_duration", type=float, default=0.5, help="Minimum seconds of speech required per file")
     parser.add_argument("--max_audio_length", type=int, default=600,
                         help="Diarize in chunks once a file is longer than this many seconds")
+    parser.add_argument("--min_speaker_speech", type=float, default=MIN_SPEAKER_SPEECH_SECONDS,
+                        help="Speech a local speaker needs before it may define a speaker of its own")
     parser.add_argument("--no_cleanup", action="store_true",
                         help="Keep the intermediate 16 kHz WAV files instead of deleting them")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging during processing")
@@ -36,6 +39,7 @@ def main():
         distance_threshold=args.distance_threshold,
         min_speech_duration=args.min_speech_duration,
         max_audio_length=args.max_audio_length,
+        min_speaker_speech=args.min_speaker_speech,
         cleanup=not args.no_cleanup,
         verbose=args.verbose
     )

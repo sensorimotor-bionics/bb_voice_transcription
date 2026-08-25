@@ -2,7 +2,8 @@ import argparse
 import sys
 import traceback
 from pathlib import Path
-from transcription import transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD
+from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                           MIN_SPEAKER_SPEECH_SECONDS)
 
 # Mirrors the default extension list in transcribe_and_diarize_folder
 MEDIA_EXTENSIONS = [".mp4", ".m4v", ".avi", ".mov", ".mkv", ".wav", ".mp3", ".flac", ".m4a", ".aac"]
@@ -70,6 +71,8 @@ def main():
                         help="Minimum seconds of speech required per file")
     parser.add_argument("--max_audio_length", type=int, default=600,
                         help="Diarize in chunks once a file is longer than this many seconds")
+    parser.add_argument("--min_speaker_speech", type=float, default=MIN_SPEAKER_SPEECH_SECONDS,
+                        help="Speech a local speaker needs before it may define a speaker of its own")
     parser.add_argument("--no_cleanup", action="store_true",
                         help="Keep the intermediate 16 kHz WAV files instead of deleting them")
     parser.add_argument("--force", action="store_true",
@@ -139,7 +142,8 @@ def main():
                 distance_threshold=args.distance_threshold,
                 min_speech_duration=args.min_speech_duration,
                 max_audio_length=args.max_audio_length,
-                cleanup=not args.no_cleanup,
+                min_speaker_speech=args.min_speaker_speech,
+                        cleanup=not args.no_cleanup,
                 verbose=args.verbose
             )
             succeeded.append((folder, summary))
