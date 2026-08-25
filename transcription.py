@@ -4,6 +4,7 @@ os.environ["NEMO_LOG_LEVEL"] = "40"
 
 import json
 import shutil
+import sys
 import tempfile
 import traceback
 import torch
@@ -685,6 +686,376 @@ def assignment_confidence(embeddings: np.ndarray,
     return scores
 
 
+def weighted_silhouette(distance_mat: np.ndarray,
+                        labels: np.ndarray,
+                        weights: np.ndarray | None = None) -> np.ndarray:
+    """
+    Silhouette score per row, with weighted mean distances.
+
+    a is the mean distance to the row's own cluster-mates and b the mean distance to the
+    nearest other cluster; the score is (b - a) / max(a, b). Around 1 the row sits deep
+    inside a well-separated cluster, around 0 the two clusters overlap where it sits, and
+    below 0 it is closer to the other cluster than to its own. Weighting by seconds of
+    speech stops a handful of short rows from deciding the outcome. A row with no
+    cluster-mates scores 0, the usual convention, since it has nothing to cohere with.
+    """
+    distance_mat = np.asarray(distance_mat, dtype=float)
+    labels = np.asarray([int(l) for l in labels])
+    n = len(labels)
+    if n == 0:
+        return np.empty(0)
+
+    weights = (np.ones(n) if weights is None
+               else np.clip(np.asarray(weights, dtype=float), 0.0, None))
+    unique = sorted(set(labels.tolist()))
+    if len(unique) < 2:
+        return np.zeros(n)
+
+    def mean_to(i, mask):
+        total = weights[mask].sum()
+        if total > 0:
+            return float((distance_mat[i, mask] * weights[mask]).sum() / total)
+        return float(distance_mat[i, mask].mean())   # every row there weighs nothing
+
+    scores = np.zeros(n)
+    for i in range(n):
+        own = labels == labels[i]
+        own[i] = False
+        if not own.any():
+            continue                                 # singleton: nothing to cohere with
+        a = mean_to(i, own)
+        b = min(mean_to(i, labels == lab) for lab in unique if lab != labels[i])
+        spread = max(a, b)
+        scores[i] = 0.0 if spread <= 0 else (b - a) / spread
+    return scores
+
+
+def eigengap_speaker_count(distance_mat: np.ndarray,
+                           max_speakers: int = 5) -> tuple[int, np.ndarray]:
+    """
+    Speaker count from the largest gap in the normalized Laplacian spectrum.
+
+    A graph of k well-connected groups has k eigenvalues near zero and a visible jump to
+    the rest, so the position of the largest gap estimates k. This is independent of any
+    clustering run, which makes it a real second opinion on the silhouette rather than a
+    rubber stamp.
+
+    The affinity graph has to be sparsified first. Speaker embeddings are all somewhat
+    alike, so the dense graph is one connected component with exactly one zero
+    eigenvalue, and the largest gap then always sits at k=1 no matter what the data holds.
+    Each row therefore keeps only its p strongest edges, and p is picked by minimising
+    p / largest-gap - the auto-tuning used for spectral diarization - so no neighbour
+    count has to be guessed.
+
+    Returns:
+        tuple[int, np.ndarray]: the estimated count and the low end of the spectrum.
+    """
+    distance_mat = np.asarray(distance_mat, dtype=float)
+    n = len(distance_mat)
+    if n <= 2:
+        return 1, np.zeros(max(n, 1))
+
+    dense = np.clip(1.0 - distance_mat / 2.0, 0.0, 1.0)   # cosine distance -> [0, 1]
+    np.fill_diagonal(dense, 0.0)
+    ranked = np.argsort(-dense, axis=1)
+
+    best = None
+    for p in range(1, min(n - 1, max(2, n // 2)) + 1):
+        keep = ranked[:, :p]
+        affinity = np.zeros_like(dense)
+        row_idx = np.repeat(np.arange(n), p)
+        affinity[row_idx, keep.ravel()] = dense[row_idx, keep.ravel()]
+        affinity = np.maximum(affinity, affinity.T)       # keep it symmetric
+
+        degree = affinity.sum(axis=1)
+        degree[degree <= 0] = 1e-12
+        inv_sqrt = 1.0 / np.sqrt(degree)
+        laplacian = np.eye(n) - affinity * inv_sqrt[:, None] * inv_sqrt[None, :]
+
+        spectrum = np.sort(np.linalg.eigvalsh(laplacian))
+        considered = spectrum[:min(max_speakers + 1, n)]
+        gaps = np.diff(considered)
+        if not len(gaps):
+            continue
+        largest = float(gaps.max())
+        ratio = p / largest if largest > 0 else np.inf
+        if best is None or ratio < best[0]:
+            best = (ratio, int(np.argmax(gaps) + 1), considered)
+
+    if best is None:
+        return 1, np.zeros(n)
+    return best[1], best[2]
+
+
+def evaluate_speaker_counts(embeddings: np.ndarray,
+                            weights: np.ndarray | None = None,
+                            candidate_counts: tuple[int, ...] = (2, 3, 4, 5),
+                            linkage: str = "average",
+                            min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                            min_cluster_share: float = 0.02) -> list[dict]:
+    """
+    Cluster at each candidate speaker count and score how well each one fits.
+
+    Per count it reports the duration-weighted silhouette, the boundary margin, the mean
+    distance to the assigned cluster's centroid (the quantity an elbow plot would use),
+    and the share of speech in the smallest cluster. A count is only "viable" if every
+    cluster holds at least min_cluster_share of the speech: a split that invents a
+    speaker who barely talks is not a real answer, however well separated it looks.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    weights = (np.ones(len(embeddings)) if weights is None
+               else np.asarray(weights, dtype=float))
+    distance_mat = speaker_distance_matrix(embeddings)
+    total = weights.sum() or float(len(embeddings))
+
+    # Counts above the number of rows that get a vote cannot be told apart, since they
+    # all clamp to the same clustering
+    available = len(voting_rows(weights, min_speaker_speech)) or len(embeddings)
+    if available < 2:
+        available = len(embeddings)
+
+    results = []
+    for count in candidate_counts:
+        if count > available:
+            continue
+        labels = cluster_local_speakers(embeddings, weights, count,
+                                        min_speaker_speech=min_speaker_speech,
+                                        linkage=linkage, announce=False)
+        centroids = cluster_centroids(embeddings, labels, weights)
+        dispersion = np.array([1.0 - float(np.dot(embeddings[i], centroids[int(labels[i])]))
+                               for i in range(len(embeddings))])
+        shares = {int(lab): float(weights[labels == lab].sum() / total)
+                  for lab in sorted(set(labels.tolist()))}
+
+        def weighted_mean(values):
+            return (float((values * weights).sum() / weights.sum()) if weights.sum() > 0
+                    else float(values.mean()))
+
+        def weighted_error(values):
+            """Standard error of the weighted mean, via the effective sample size."""
+            total_w = weights.sum()
+            if total_w <= 0 or (weights ** 2).sum() <= 0:
+                return float(values.std() / max(np.sqrt(len(values)), 1))
+            mean = weighted_mean(values)
+            variance = float((weights * (values - mean) ** 2).sum() / total_w)
+            effective_n = float(total_w ** 2 / (weights ** 2).sum())
+            return float(np.sqrt(variance / effective_n)) if effective_n > 0 else 0.0
+
+        silhouettes = weighted_silhouette(distance_mat, labels, weights)
+        results.append({
+            "num_speakers": count,
+            "clusters": len(shares),
+            "silhouette": weighted_mean(silhouettes),
+            "silhouette_se": weighted_error(silhouettes),
+            "margin": weighted_mean(assignment_confidence(embeddings, labels, weights)),
+            "dispersion": weighted_mean(dispersion),
+            "min_share": min(shares.values()),
+            "shares": shares,
+            "labels": labels,
+            "viable": min(shares.values()) >= min_cluster_share,
+        })
+    return results
+
+
+def choose_speaker_count(embeddings: np.ndarray,
+                         weights: np.ndarray | None = None,
+                         candidate_counts: tuple[int, ...] = (2, 3, 4, 5),
+                         linkage: str = "average",
+                         min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                         min_cluster_share: float = 0.02,
+                         distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD) -> dict:
+    """
+    Estimate how many speakers a set of local speaker embeddings really holds.
+
+    Why not the elbow: within-cluster dispersion falls monotonically as clusters are
+    added, so an elbow plot has no optimum, only a bend somebody has to eyeball. The
+    silhouette instead scores cohesion against separation on a fixed -1..1 scale, so it
+    has a genuine maximum and its value means something on its own. Two things make it
+    trustworthy here: weighting every average by seconds of speech, so a four-second
+    fragment cannot outvote a five-minute speaker, and refusing counts that leave a
+    cluster holding almost no speech, which is how a split that merely isolates an
+    outlier gets rejected however clean it looks.
+
+    The eigengap of the normalized Laplacian is reported alongside as an independent
+    check: it comes from the affinity graph rather than from any clustering run, so
+    agreement between the two is meaningful and disagreement is a flag to go and look.
+
+    Returns:
+        dict: chosen "num_speakers", the per-count "scores", the "eigengap" estimate,
+        whether the two "agree", and "looks_like_one_speaker" when even the best split
+        leaves the clusters closer together than distance_threshold.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    scores = evaluate_speaker_counts(embeddings, weights, candidate_counts, linkage,
+                                     min_speaker_speech, min_cluster_share)
+    if not scores:
+        return {"num_speakers": 1, "scores": [], "eigengap": 1, "agree": True,
+                "looks_like_one_speaker": True,
+                "reason": "too few speaker embeddings to compare counts"}
+
+    viable = [s for s in scores if s["viable"]]
+    pool = viable or scores
+    peak = max(pool, key=lambda s: s["silhouette"])
+
+    # Parsimony: take the fewest speakers whose score is within one standard error of the
+    # peak. Silhouette differences between neighbouring counts are often smaller than the
+    # spread across rows that produced them, and reading such a difference as a real
+    # speaker is how a recording of two people ends up reported as four. This is the same
+    # one-standard-error rule used to prefer simpler models in cross-validation, and
+    # unlike an elbow it needs no one to eyeball a bend.
+    tolerance = peak["silhouette"] - peak["silhouette_se"]
+    best = min((s for s in pool if s["silhouette"] >= tolerance),
+               key=lambda s: s["num_speakers"], default=peak)
+    rejected = [s["num_speakers"] for s in scores if not s["viable"]]
+
+    distance_mat = speaker_distance_matrix(embeddings)
+    eigengap, _ = eigengap_speaker_count(distance_mat, max(candidate_counts))
+
+    # Even the best split may just be one person cut in half
+    centroids = cluster_centroids(embeddings, best["labels"], weights)
+    spread = max((1.0 - float(np.dot(a, b))
+                  for i, a in centroids.items() for j, b in centroids.items() if i < j),
+                 default=0.0)
+    one_speaker = spread <= distance_threshold
+
+    reason = (f"weighted silhouette {best['silhouette']:.3f} at {best['num_speakers']} "
+              f"speaker(s)")
+    if best["num_speakers"] != peak["num_speakers"]:
+        reason += (f"; {peak['num_speakers']} scored higher ({peak['silhouette']:.3f}) but "
+                   f"within one standard error ({peak['silhouette_se']:.3f}), so the "
+                   f"simpler split wins")
+    if rejected:
+        reason += f"; rejected {rejected} for leaving a cluster under {min_cluster_share:.0%}"
+    if not viable:
+        reason += "; no count was viable, fell back to the best of a bad set"
+    if one_speaker:
+        reason += (f"; clusters only {spread:.3f} apart, so this may really be one "
+                   f"speaker")
+
+    return {"num_speakers": best["num_speakers"],
+            "scores": scores,
+            "eigengap": eigengap,
+            "agree": eigengap == best["num_speakers"],
+            "looks_like_one_speaker": one_speaker,
+            "reason": reason}
+
+
+SPEAKER_COUNT_POLICIES = ("ask", "given", "predicted")
+
+
+def describe_speaker_count(score: dict, weights: np.ndarray | None = None) -> str:
+    """One-line summary of a candidate count: its score and how the speech divides."""
+    labels = score["labels"]
+    weights = np.ones(len(labels)) if weights is None else np.asarray(weights, dtype=float)
+    masses = {}
+    for label, weight in zip(labels, weights):
+        masses[int(label)] = masses.get(int(label), 0.0) + float(weight)
+    split = " / ".join(f"{m:.0f}s" for m in sorted(masses.values(), reverse=True))
+    return (f"{score['num_speakers']} speaker(s): silhouette {score['silhouette']:+.3f}"
+            f" +-{score['silhouette_se']:.3f}, speech {split}")
+
+
+def prompt_speaker_count(given: int, prediction: dict, weights: np.ndarray | None = None) -> int:
+    """
+    Ask which speaker count to use when the given and predicted counts disagree.
+
+    Pressing enter keeps the given count: the caller stating a number is a deliberate
+    claim about the recording, so it wins any tie or fumbled answer. A bare number is
+    accepted too, for when neither candidate is right.
+    """
+    predicted = prediction["num_speakers"]
+    by_count = {s["num_speakers"]: s for s in prediction["scores"]}
+
+    print(f"\n\tSpeaker count mismatch: you asked for {given}, "
+          f"the embeddings support {predicted}.")
+    for count in (given, predicted):
+        if count in by_count:
+            print(f"\t  {describe_speaker_count(by_count[count], weights)}")
+    if prediction["eigengap"] != predicted:
+        print(f"\t  (spectral gap suggests {prediction['eigengap']}, a weaker signal)")
+    if prediction["looks_like_one_speaker"]:
+        print("\t  (the clusters are close enough together to be one speaker)")
+
+    answer = input(f"\tUse [{given}] given, [{predicted}] predicted, "
+                   f"or type another number: ").strip().lower()
+    if answer in ("", "g", "given", str(given)):
+        return given
+    if answer in ("p", "predicted", str(predicted)):
+        return predicted
+    try:
+        chosen = int(answer)
+        if chosen > 0:
+            return chosen
+    except ValueError:
+        pass
+    print(f"\tDid not understand {answer!r}; keeping the given count of {given}.")
+    return given
+
+
+def reconcile_speaker_count(embeddings: np.ndarray,
+                            weights: np.ndarray | None = None,
+                            given: int | None = None,
+                            candidate_counts: tuple[int, ...] = (2, 3, 4, 5),
+                            policy: str = "ask",
+                            linkage: str = "average",
+                            min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                            distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD
+                            ) -> int | None:
+    """
+    Check a caller-supplied speaker count against the count the embeddings support.
+
+    Args:
+        embeddings (np.ndarray): L2-normalized local speaker embeddings.
+        weights (np.ndarray | None): Seconds of speech behind each row.
+        given (int | None): The count the caller asked for. None means the caller wants
+            the distance threshold to decide, so there is nothing to reconcile.
+        candidate_counts (tuple[int, ...]): Counts to score. The given count is always
+            added, since a prediction that cannot return it would always disagree.
+        policy (str): "ask" to prompt on a mismatch, "given" to keep the caller's number,
+            "predicted" to take the estimate. "ask" falls back to "given" when stdin is
+            not interactive, so a batch or scheduled run never blocks on a question
+            nobody is there to answer.
+
+    Returns:
+        int | None: The count to cluster with, or None when none was given.
+    """
+    if given is None:
+        return None
+    if policy not in SPEAKER_COUNT_POLICIES:
+        raise ValueError(f"policy must be one of {SPEAKER_COUNT_POLICIES}, got {policy!r}")
+
+    embeddings = np.asarray(embeddings, dtype=float)
+    if len(embeddings) < 2:
+        return given
+
+    candidates = tuple(sorted(set(candidate_counts) | {given}))
+    prediction = choose_speaker_count(embeddings, weights, candidates, linkage,
+                                      min_speaker_speech,
+                                      distance_threshold=distance_threshold)
+    predicted = prediction["num_speakers"]
+
+    if predicted == given:
+        print(f"\tSpeaker count {given} agrees with the embeddings ({prediction['reason']}).")
+        return given
+
+    if policy == "given":
+        print(f"\tEmbeddings suggest {predicted} speaker(s), keeping the requested {given} "
+              f"({prediction['reason']}).")
+        return given
+    if policy == "predicted":
+        print(f"\tEmbeddings suggest {predicted} speaker(s) rather than the requested "
+              f"{given}; using {predicted} ({prediction['reason']}).")
+        return predicted
+
+    if not sys.stdin or not sys.stdin.isatty():
+        print(f"\tEmbeddings suggest {predicted} speaker(s) rather than the requested "
+              f"{given}. Nothing is attached to answer a prompt, so keeping {given}. "
+              f"Pass speaker_count_policy='predicted' to prefer the estimate.")
+        return given
+
+    return prompt_speaker_count(given, prediction, weights)
+
+
 def _align_labels(reference: np.ndarray,
                   other: np.ndarray,
                   weights: np.ndarray | None = None) -> np.ndarray:
@@ -797,6 +1168,7 @@ def post_hoc_diarization(transcript: list[dict],
                          enc_model: EncDecSpeakerLabelModel | None = None,
                          distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                          min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                         speaker_count_policy: str = "ask",
                          verbose: bool = False):
 
     # Identify all unique chunk-level speakers in the transcript
@@ -830,6 +1202,10 @@ def post_hoc_diarization(transcript: list[dict],
                                  distance_threshold)
 
     weights = speaker_weights(transcript, valid_speakers)
+    num_speakers = reconcile_speaker_count(embedding_matrix, weights, num_speakers,
+                                           policy=speaker_count_policy,
+                                           min_speaker_speech=min_speaker_speech,
+                                           distance_threshold=distance_threshold)
     speaker_labels = cluster_local_speakers(embedding_matrix,
                                             weights,
                                             num_speakers,
@@ -865,6 +1241,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                  num_speakers: int | None = 2,
                                  distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                                  min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+                                 speaker_count_policy: str = "ask",
                                  cleanup: bool = True,
                                  whisper_model: WhisperModel | None = None,
                                  diar_model: SortformerEncLabelModel | None = None,
@@ -948,6 +1325,7 @@ def transcribe_and_diarize_audio(audio_path: os.PathLike,
                                           enc_model=enc_model,
                                           distance_threshold=distance_threshold,
                                           min_speaker_speech=min_speaker_speech,
+                                          speaker_count_policy=speaker_count_policy,
                                           verbose=verbose)
 
     # Dump the transcript as .txt
@@ -976,6 +1354,7 @@ def transcribe_and_diarize_folder(
     global_num_speakers: int | None = None,
     distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
     min_speaker_speech: float = MIN_SPEAKER_SPEECH_SECONDS,
+    speaker_count_policy: str = "ask",
     verbose: bool = False,
     cleanup: bool = True
 ) -> dict:
@@ -1000,6 +1379,10 @@ def transcribe_and_diarize_folder(
             pairwise distances it is compared against.
         min_speaker_speech (float): A local speaker with less assigned speech than this is
             attached to the nearest global speaker rather than defining one of its own.
+        speaker_count_policy (str): What to do when global_num_speakers disagrees with the
+            count the embeddings support: "ask" to prompt, "given" to keep the requested
+            number, "predicted" to take the estimate. "ask" keeps the requested number
+            when stdin is not interactive, so a scheduled run never stalls on a prompt.
         verbose (bool): Extra logging.
         cleanup (bool): Automatically remove intermediate 16k WAV files.
 
@@ -1190,9 +1573,14 @@ def transcribe_and_diarize_folder(
                                 [m["local_speaker"]])[0]
                 for m in embedding_metadata])
 
+            wanted_speakers = reconcile_speaker_count(global_matrix, pool_weights,
+                                                      global_num_speakers,
+                                                      policy=speaker_count_policy,
+                                                      min_speaker_speech=min_speaker_speech,
+                                                      distance_threshold=distance_threshold)
             global_labels = cluster_local_speakers(global_matrix,
                                                    pool_weights,
-                                                   num_speakers=global_num_speakers,
+                                                   num_speakers=wanted_speakers,
                                                    distance_threshold=distance_threshold,
                                                    min_speaker_speech=min_speaker_speech,
                                                    verbose=verbose)
