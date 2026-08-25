@@ -15,6 +15,7 @@ from pathlib import Path
 from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
 from nemo.utils import logging as nemo_logging
 from audio_utils import prepare_audio, prepared_audio_path, PREPARED_AUDIO_SUFFIX
+from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import AgglomerativeClustering
 from post_processing import export_transcript_by_speaker, concatenate_batch_transcripts
 
@@ -428,9 +429,14 @@ def extract_unique_speaker_embeddings(transcript: list[dict],
     return _normalize_rows(embedding_matrix), valid_speakers
 
 
+PRECOMPUTED_LINKAGES = ("average", "complete", "single")
+
+
 def cluster_embeddings(distance_mat: np.ndarray,
                        num_speakers: int | None = None,
-                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD):
+                       distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                       linkage: str = "average",
+                       embeddings: np.ndarray | None = None):
     """
     Group speaker embeddings by cosine distance.
 
@@ -442,6 +448,15 @@ def cluster_embeddings(distance_mat: np.ndarray,
             caller knowing the recording, which beats anything inferred from distances.
         distance_threshold (float): Distance at which speakers stop being merged when
             num_speakers is None.
+        linkage (str): "average", "complete" or "single" to work from distance_mat, or
+            "ward" to work from embeddings. The three linkage rules differ in what they
+            do with an outlier: average and single tend to peel it off into a cluster of
+            its own, while ward minimizes within-cluster variance and so splits along the
+            bulk of the data instead.
+        embeddings (np.ndarray | None): The L2-normalized embeddings behind distance_mat.
+            Required for linkage="ward", which scikit-learn only implements for euclidean
+            distance. On L2-normalized rows euclidean distance is a monotone function of
+            cosine distance, so this is the same geometry, scored differently.
 
     Returns:
         np.ndarray: Integer cluster label per row of distance_mat.
@@ -450,19 +465,231 @@ def cluster_embeddings(distance_mat: np.ndarray,
         return np.zeros(len(distance_mat), dtype=int)
 
     if num_speakers is None:
-        feature_clusterer = AgglomerativeClustering(n_clusters=None,
-                                                    metric='precomputed',
-                                                    linkage='average',
-                                                    distance_threshold=distance_threshold)
+        n_clusters = None
     elif isinstance(num_speakers, int) and num_speakers > 0:
-        feature_clusterer = AgglomerativeClustering(n_clusters=num_speakers,
-                                                    metric='precomputed',
-                                                    linkage='average')
-
+        n_clusters = num_speakers
+        distance_threshold = None  # type: ignore[assignment]
     else:
         raise ValueError(f"num_speakers must be a positive integer or None, got {num_speakers}")
 
+    if linkage == "ward":
+        if embeddings is None:
+            raise ValueError("linkage='ward' needs the embeddings: scikit-learn only "
+                             "implements ward for euclidean distance, not for a "
+                             "precomputed distance matrix")
+        # Note the threshold changes meaning here: ward merges on variance increase, not
+        # on the cosine distances DEFAULT_SPEAKER_DISTANCE_THRESHOLD was chosen against.
+        feature_clusterer = AgglomerativeClustering(n_clusters=n_clusters,
+                                                    linkage='ward',
+                                                    distance_threshold=distance_threshold)
+        return feature_clusterer.fit_predict(np.asarray(embeddings, dtype=float))
+
+    if linkage not in PRECOMPUTED_LINKAGES:
+        raise ValueError(f"linkage must be 'ward' or one of {PRECOMPUTED_LINKAGES}, "
+                         f"got {linkage!r}")
+
+    feature_clusterer = AgglomerativeClustering(n_clusters=n_clusters,
+                                                metric='precomputed',
+                                                linkage=linkage,
+                                                distance_threshold=distance_threshold)
+
     return feature_clusterer.fit_predict(distance_mat)
+
+
+def cluster_centroids(embeddings: np.ndarray,
+                      labels: np.ndarray,
+                      weights: np.ndarray | None = None) -> dict[int, np.ndarray]:
+    """
+    L2-normalized centroid per cluster, optionally weighted so that a cluster is
+    represented by the speech it is mostly made of rather than by its member count.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    labels = np.asarray([int(l) for l in labels])
+    weights = np.ones(len(labels)) if weights is None else np.asarray(weights, dtype=float)
+
+    centroids = {}
+    for label in sorted(set(labels.tolist())):
+        members = labels == label
+        w = np.clip(weights[members], 1e-6, None)
+        centroid = np.average(embeddings[members], axis=0, weights=w)
+        norm = np.linalg.norm(centroid)
+        centroids[label] = centroid / norm if norm else centroid
+    return centroids
+
+
+def assignment_confidence(embeddings: np.ndarray,
+                          labels: np.ndarray,
+                          weights: np.ndarray | None = None) -> np.ndarray:
+    """
+    How far each speaker sits from the boundary between its cluster and the next one.
+
+    For each row, d1 is the cosine distance to its own cluster's centroid and d2 the
+    distance to the closest other centroid; the score is (d2 - d1) / (d2 + d1). That is
+    0.0 when the two are equidistant, i.e. the speaker sits exactly on the decision
+    boundary and could have gone either way, and approaches 1.0 as it converges on its
+    own centroid. Negative values mean the row is closer to another cluster's centroid
+    than to its own, which average linkage can produce when it merges a chain of points.
+
+    Its own cluster's centroid is computed with the row left out. Including it would let
+    a row vouch for itself, and a cluster of one would then sit exactly on its own
+    centroid and score a perfect 1.0 - reporting maximum confidence for exactly the
+    spurious one-off speakers that are least trustworthy. A row with no cluster-mates has
+    no supporting evidence at all, so it scores 0.0.
+
+    With only one cluster there is no boundary to be near, so the score is 1.0.
+
+    Args:
+        embeddings (np.ndarray): L2-normalized embeddings, one row per speaker.
+        labels (np.ndarray): Cluster label per row.
+        weights (np.ndarray | None): Per-row weight for the centroids, e.g. seconds of
+            speech behind each speaker.
+
+    Returns:
+        np.ndarray: Confidence per row, in [-1, 1].
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    labels = np.asarray([int(l) for l in labels])
+    if len(labels) == 0:
+        return np.empty(0)
+
+    weights = (np.ones(len(labels)) if weights is None
+               else np.clip(np.asarray(weights, dtype=float), 1e-6, None))
+    centroids = cluster_centroids(embeddings, labels, weights)
+    if len(centroids) < 2:
+        return np.ones(len(labels))
+
+    # Weighted sums per cluster, so a row can be removed from its own centroid cheaply
+    sums, totals = {}, {}
+    for label in centroids:
+        members = labels == label
+        sums[label] = (embeddings[members] * weights[members, None]).sum(axis=0)
+        totals[label] = weights[members].sum()
+
+    scores = np.empty(len(labels))
+    for i, label in enumerate(labels):
+        label = int(label)
+        remaining = totals[label] - weights[i]
+        if remaining <= 0:
+            scores[i] = 0.0  # nothing else in the cluster to support this assignment
+            continue
+
+        own_centroid = (sums[label] - embeddings[i] * weights[i]) / remaining
+        norm = np.linalg.norm(own_centroid)
+        if norm:
+            own_centroid = own_centroid / norm
+        own = 1.0 - float(np.dot(embeddings[i], own_centroid))
+
+        nearest_other = min(1.0 - float(np.dot(embeddings[i], c))
+                            for lab, c in centroids.items() if lab != label)
+        total = own + nearest_other
+        scores[i] = 1.0 if total <= 0 else (nearest_other - own) / total
+    return scores
+
+
+def _align_labels(reference: np.ndarray,
+                  other: np.ndarray,
+                  weights: np.ndarray | None = None) -> np.ndarray:
+    """
+    Renumber `other` so its clusters line up with `reference` wherever they agree.
+
+    Cluster ids are arbitrary, so two clusterings that partition the speakers identically
+    can still disagree on every number. Pairing the ids by maximum overlap first means a
+    later comparison reports real regrouping rather than relabelling.
+    """
+    reference = np.asarray([int(l) for l in reference])
+    other = np.asarray([int(l) for l in other])
+    weights = np.ones(len(reference)) if weights is None else np.asarray(weights, dtype=float)
+
+    ref_ids = sorted(set(reference.tolist()))
+    other_ids = sorted(set(other.tolist()))
+    overlap = np.zeros((len(other_ids), len(ref_ids)))
+    for i, o in enumerate(other_ids):
+        for j, r in enumerate(ref_ids):
+            overlap[i, j] = weights[(other == o) & (reference == r)].sum()
+
+    rows, cols = linear_sum_assignment(-overlap)
+    mapping = {other_ids[r]: ref_ids[c] for r, c in zip(rows, cols)}
+    spare = max(ref_ids) + 1 if ref_ids else 0
+    for o in other_ids:                     # more clusters than the reference has
+        if o not in mapping:
+            mapping[o] = spare
+            spare += 1
+    return np.array([mapping[o] for o in other.tolist()])
+
+
+def compare_linkages(embeddings: np.ndarray,
+                     speakers: list[str],
+                     num_speakers: int | None = None,
+                     distance_threshold: float = DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
+                     linkages: tuple[str, ...] = ("average", "ward"),
+                     weights: np.ndarray | None = None) -> dict:
+    """
+    Cluster the same speakers under several linkage rules and report where they differ.
+
+    The first linkage is the reference; the others are renumbered to line up with it, so
+    a speaker is only reported as disagreeing when it genuinely lands in a different
+    group rather than under a different number.
+
+    Args:
+        embeddings (np.ndarray): L2-normalized embeddings, one row per speaker.
+        speakers (list[str]): Speaker labels aligned with the rows of embeddings.
+        num_speakers (int | None): Passed through to cluster_embeddings.
+        distance_threshold (float): Passed through, used when num_speakers is None. Note
+            it is not comparable between ward and the cosine linkages.
+        linkages (tuple[str, ...]): Linkage rules to run.
+        weights (np.ndarray | None): Per-speaker weight, e.g. seconds of speech.
+
+    Returns:
+        dict: {"linkages", "n_clusters" per linkage, "speakers" mapping each speaker to
+        its per-linkage label and confidence plus an "agrees" flag, and "disagreeing"}.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    distance_mat = speaker_distance_matrix(embeddings)
+
+    labels, confidence = {}, {}
+    for linkage in linkages:
+        raw = cluster_embeddings(distance_mat, num_speakers, distance_threshold,
+                                 linkage=linkage, embeddings=embeddings)
+        confidence[linkage] = assignment_confidence(embeddings, raw, weights)
+        labels[linkage] = raw if linkage == linkages[0] else _align_labels(
+            labels[linkages[0]], raw, weights)
+
+    per_speaker, disagreeing = {}, []
+    for i, speaker in enumerate(speakers):
+        entry = {linkage: {"speaker": f"speaker_{int(labels[linkage][i])}",
+                           "confidence": float(confidence[linkage][i])}
+                 for linkage in linkages}
+        agrees = len({entry[l]["speaker"] for l in linkages}) == 1
+        entry["agrees"] = agrees
+        per_speaker[speaker] = entry
+        if not agrees:
+            disagreeing.append(speaker)
+
+    return {"linkages": tuple(linkages),
+            "n_clusters": {l: len(set(labels[l].tolist())) for l in linkages},
+            "speakers": per_speaker,
+            "disagreeing": disagreeing}
+
+
+def tag_transcript_clustering(transcript: list[dict], comparison: dict) -> list[dict]:
+    """
+    Annotate each segment with what every linkage made of its speaker.
+
+    Adds speaker_<linkage> and confidence_<linkage> per segment, plus clustering_agrees.
+    The segment's own "speaker" is left alone, so this is safe to run for inspection
+    without changing the transcript the pipeline produced.
+    """
+    for t in transcript:
+        local = t.get("local_speaker", t.get("speaker"))
+        entry = comparison["speakers"].get(local)
+        if entry is None:
+            t["clustering_agrees"] = None
+            continue
+        for linkage in comparison["linkages"]:
+            t[f"speaker_{linkage}"] = entry[linkage]["speaker"]
+            t[f"confidence_{linkage}"] = round(entry[linkage]["confidence"], 4)
+        t["clustering_agrees"] = entry["agrees"]
+    return transcript
 
 
 def post_hoc_diarization(transcript: list[dict],
@@ -506,12 +733,18 @@ def post_hoc_diarization(transcript: list[dict],
     # Create mapping dict (e.g. {'speaker_10': 'speaker_0', 'speaker_20': 'speaker_0'})
     spk_to_global = {spk: f"speaker_{label}" for spk, label in zip(valid_speakers, speaker_labels)}
 
+    # How far each chunk speaker sits from the boundary with the next nearest speaker
+    spk_confidence = dict(zip(valid_speakers,
+                              assignment_confidence(embedding_matrix, speaker_labels)))
+
     # Remap transcript. Chunk speakers that produced no embedding aren't in the mapping,
     # so they keep their local label rather than being folded into an arbitrary cluster.
     for t in transcript:
         local_speaker = t.get('local_speaker', t['speaker'])
         t.setdefault('local_speaker', local_speaker)
         t['speaker'] = spk_to_global.get(local_speaker, local_speaker)
+        if local_speaker in spk_confidence:
+            t['speaker_confidence'] = round(float(spk_confidence[local_speaker]), 4)
 
     return transcript
 
@@ -680,8 +913,7 @@ def transcribe_and_diarize_folder(
         if f.is_file() and f.suffix.lower() in video_extensions
     ])
 
-    # Drop leftover 16 kHz intermediates whose source file is also here (from a run that
-    # crashed or ran with cleanup=False), so one recording is not transcribed twice.
+    # Drop leftover 16 kHz intermediates
     sources = {f.name for f in media_files}
     redundant = [f for f in media_files
                  if f.name.endswith(PREPARED_AUDIO_SUFFIX)
@@ -706,8 +938,6 @@ def transcribe_and_diarize_folder(
     whisper_model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
     diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").to(device).eval() # type: ignore
     enc_model = EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_small").to(device).eval() # type: ignore
-    # Read the device back off the encoder rather than trusting the string: the audio
-    # tensors have to be created wherever its weights actually ended up.
     enc_device = next(enc_model.parameters()).device
 
     file_records = []
@@ -826,7 +1056,8 @@ def transcribe_and_diarize_folder(
     # separate from exporting: if there is nothing to cluster, or the clustering itself
     # fails, transcripts are still written with their per-file labels rather than the
     # whole folder's transcription work being discarded.
-    file_spk_mappings = {}
+    file_spk_mappings = {}    # speech_file_idx -> {local_speaker -> global label}
+    file_spk_confidence = {}  # speech_file_idx -> {local_speaker -> confidence}
     if all_speaker_embeddings:
         print(f"\nRunning cross-file speaker clustering across {len(all_speaker_embeddings)} local speaker representation(s)...")
         try:
@@ -847,17 +1078,20 @@ def transcribe_and_diarize_folder(
             else:
                 print(f"\tSplit into {len(set(global_labels))} global speaker(s) as requested")
 
+            # How far each local speaker sits from the boundary with the next nearest
+            # global speaker, so a borderline assignment can be spotted downstream.
+            global_confidence = assignment_confidence(global_matrix, global_labels)
+
             # Build mapping: speech_file_idx -> {local_speaker -> global_speaker_label}
-            for meta, g_label in zip(embedding_metadata, global_labels):
+            for meta, g_label, conf in zip(embedding_metadata, global_labels, global_confidence):
                 sf_idx = meta["speech_file_idx"]
                 loc_spk = meta["local_speaker"]
-                if sf_idx not in file_spk_mappings:
-                    file_spk_mappings[sf_idx] = {}
-                file_spk_mappings[sf_idx][loc_spk] = f"speaker_{g_label}"
+                file_spk_mappings.setdefault(sf_idx, {})[loc_spk] = f"speaker_{g_label}"
+                file_spk_confidence.setdefault(sf_idx, {})[loc_spk] = float(conf)
         except Exception as exc:
             print(f"\tCross-file speaker clustering failed ({type(exc).__name__}: {exc}); "
                   "keeping per-file speaker labels.")
-            file_spk_mappings = {}
+            file_spk_mappings, file_spk_confidence = {}, {}
     else:
         print("\nNo speaker embeddings to cluster; keeping per-file speaker labels.")
 
@@ -866,12 +1100,15 @@ def transcribe_and_diarize_folder(
         if not rec.get("has_speech", False):
             continue
         spk_map = file_spk_mappings.get(rec["speech_file_idx"], {})
+        conf_map = file_spk_confidence.get(rec["speech_file_idx"], {})
 
         # Key off local_speaker, not speaker, so the remap stays correct even if
         # a global label collides with a local one (both are "speaker_<n>").
         for t in rec["transcript"]:
             t.setdefault("local_speaker", t["speaker"])
             t["speaker"] = spk_map.get(t["local_speaker"], t["speaker"])
+            if t["local_speaker"] in conf_map:
+                t["speaker_confidence"] = round(conf_map[t["local_speaker"]], 4)
 
         # Update speakers present list
         rec["speakers"] = sorted(list(set(t["speaker"] for t in rec["transcript"])))
@@ -912,5 +1149,4 @@ def transcribe_and_diarize_folder(
     # Dump concatenated transcript
     concatenate_batch_transcripts(summary, output_path=output_dir)
 
-    print("Batch processing complete!")
     return summary
