@@ -1415,8 +1415,9 @@ def transcribe_and_diarize_folder(
                  and any(f"{f.name[:-len(PREPARED_AUDIO_SUFFIX)]}{ext}" in sources
                          for ext in video_extensions)]
     if redundant:
-        print(f"Ignoring {len(redundant)} leftover intermediate file(s): "
-              f"{', '.join(f.name for f in redundant)}")
+        if verbose:
+            print(f"Ignoring {len(redundant)} leftover intermediate file(s): "
+                f"{', '.join(f.name for f in redundant)}")
         media_files = [f for f in media_files if f not in redundant]
 
     if not media_files:
@@ -1442,7 +1443,8 @@ def transcribe_and_diarize_folder(
     speech_file_count = 0
 
     for idx, file_path in enumerate(media_files, start=1):
-        print(f"\n--- [{idx}/{len(media_files)}] Processing: {file_path.name} ---")
+        if verbose:
+            print(f"\n--- [{idx}/{len(media_files)}] Processing: {file_path.name} ---")
         wav_path = prepared_audio_path(file_path)
 
         # One unusual file shouldn't abandon a folder that may already have hours of
@@ -1470,7 +1472,8 @@ def transcribe_and_diarize_folder(
             has_speech = detect_speech(segments, min_speech_duration=min_speech_duration)
 
             if not has_speech:
-                print(f"\tNo speech detected in {file_path.name}.")
+                if verbose:
+                    print(f"\tNo speech detected in {file_path.name}.")
                 file_records.append({
                     "file_name": file_path.name,
                     "stem": file_path.stem,
@@ -1482,7 +1485,8 @@ def transcribe_and_diarize_folder(
                 })
                 continue
 
-            print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
+            if verbose:
+                print(f"\tSpeech detected! ({audio_duration:.1f}s) Running diarization...")
             speaker_times, _ = diarize_audio(diar_model, wav_path, segments, audio_duration, max_audio_length, verbose=verbose)
             transcript = create_transcript(segments, speaker_times)
 
@@ -1635,7 +1639,8 @@ def transcribe_and_diarize_folder(
         with open(json_out, "w", encoding="utf-8") as f:
             f.write(json.dumps(rec["transcript"], indent=4) + "\n")
 
-        print(f"\tSaved transcript for {rec['file_name']} -> {txt_out.name}")
+        if verbose:
+            print(f"\tSaved transcript for {rec['file_name']} -> {txt_out.name}")
 
     summary = {
         "total_files": len(media_files),

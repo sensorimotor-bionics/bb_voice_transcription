@@ -13,6 +13,8 @@ dependencies:
     - faster_whisper
     - nemo_toolkit[asr]
     - pydub
+    # Talks to the local Ollama server for interviewer/interviewee labelling
+    - requests
     - torch==2.11.0+cu128
     - scikit-learn
     - numpy

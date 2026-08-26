@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                            MIN_SPEAKER_SPEECH_SECONDS, SPEAKER_COUNT_POLICIES)
+from speaker_roles import add_role_arguments, roles_requested, label_from_args
 
 def main():
     parser = argparse.ArgumentParser(
@@ -25,6 +26,7 @@ def main():
     parser.add_argument("--no_cleanup", action="store_true",
                         help="Keep the intermediate 16 kHz WAV files instead of deleting them")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging during processing")
+    add_role_arguments(parser)
 
     args = parser.parse_args()
 
@@ -48,6 +50,17 @@ def main():
         verbose=args.verbose
     )
     print(summary)
+
+    if roles_requested(args):
+        # Transcripts are already on disk, so a missing Ollama server or model must not
+        # turn a finished transcription run into a failure.
+        try:
+            label_from_args(summary["output_dir"], args, verbose=args.verbose)
+        except (RuntimeError, ValueError) as exc:
+            print(f"Speaker role labelling failed ({exc})")
+            print("The transcripts themselves were written; rerun the labelling on its own with "
+                  "label_speakers.py once the problem is fixed.")
+
     print("Batch processing completed successfully.")
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import traceback
 from pathlib import Path
 from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                            MIN_SPEAKER_SPEECH_SECONDS, SPEAKER_COUNT_POLICIES)
+from speaker_roles import add_role_arguments, roles_requested, label_from_args
 
 # Mirrors the default extension list in transcribe_and_diarize_folder
 MEDIA_EXTENSIONS = [".mp4", ".m4v", ".avi", ".mov", ".mkv", ".wav", ".mp3", ".flac", ".m4a", ".aac"]
@@ -42,7 +43,8 @@ def clear_previous_output(folder: Path) -> list[Path]:
         return []
 
     patterns = ["*_transcript.txt", "*_transcript.json", "batch_summary.json",
-                "concatenated_transcript.*", "*.relabeled.json", "*.relabeled.txt"]
+                "concatenated_transcript.*", "*.relabeled.json", "*.relabeled.txt",
+                "*.speaker_roles.json"]
     removed = []
     for pattern in patterns:
         for path in sorted(transcripts.glob(pattern)):
@@ -85,6 +87,7 @@ def main():
     parser.add_argument("--dry_run", action="store_true",
                         help="List what would be processed or skipped, then exit without transcribing")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging during processing")
+    add_role_arguments(parser)
 
     args = parser.parse_args()
 
@@ -123,13 +126,15 @@ def main():
 
     if args.dry_run:
         print(f"\nDry run: {len(pending)} to process, {len(skipped)} skipped. Nothing was written.")
+        if roles_requested(args):
+            print(f"Speaker roles would be labelled per subfolder with {args.role_model}.")
         return
 
     if not pending:
         print("\nNothing to do.")
         return
 
-    succeeded, failed = [], []
+    succeeded, failed, unlabelled = [], [], []
     for i, folder in enumerate(pending, start=1):
         print(f"\n=== [{i}/{len(pending)}] {folder.name} ===")
         try:
@@ -158,6 +163,17 @@ def main():
             if args.verbose:
                 traceback.print_exc()
             failed.append((folder, exc))
+            continue
+
+        # Each subfolder is one session, so roles are decided per subfolder. This runs
+        # after the transcripts are safely on disk and cannot undo them: a stopped Ollama
+        # server costs the labels, not hours of transcription.
+        if roles_requested(args):
+            try:
+                label_from_args(summary["output_dir"], args, verbose=args.verbose)
+            except (RuntimeError, ValueError) as exc:
+                print(f"  Speaker role labelling failed for {folder.name}: {exc}")
+                unlabelled.append((folder, exc))
 
     print(f"\n{'=' * 60}")
     print(f"Processed {len(succeeded)} subfolder(s), {len(failed)} failed, {len(skipped)} skipped.")
@@ -165,6 +181,12 @@ def main():
         print(f"  OK   {folder.name}: {summary['files_with_speech']}/{summary['total_files']} file(s) with speech")
     for folder, exc in failed:
         print(f"  FAIL {folder.name}: {type(exc).__name__}: {exc}")
+    if unlabelled:
+        # Not counted as a failure: these subfolders have their transcripts, only the
+        # interviewer/participant labels are missing, and label_speakers.py can add them.
+        print(f"\n{len(unlabelled)} subfolder(s) were transcribed but not role-labelled:")
+        for folder, exc in unlabelled:
+            print(f"  UNLABELLED {folder.name}: {exc}")
 
     if failed:
         sys.exit(1)
