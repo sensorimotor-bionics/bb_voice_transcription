@@ -1,10 +1,17 @@
 import json
 import subprocess
+from collections.abc import Iterable
 from os import PathLike
 from pathlib import Path
 
 # Suffix of the intermediate 16 kHz mono WAV that the rest of the pipeline reads.
 PREPARED_AUDIO_SUFFIX = ".16k.wav"
+
+# Media containers the pipeline will read. Kept here rather than in each entry point so
+# the batch scripts, transcribe_and_diarize_folder, and the intermediate-file sweep all
+# agree on what counts as a source file.
+MEDIA_EXTENSIONS = [".mp4", ".m4v", ".avi", ".mov", ".mkv",
+                    ".wav", ".mp3", ".flac", ".m4a", ".aac"]
 
 
 def get_audio_duration(input_file: PathLike) -> float:
@@ -50,6 +57,63 @@ def prepared_audio_path(input_file: PathLike) -> Path:
     if input_file.name.endswith(PREPARED_AUDIO_SUFFIX):
         return input_file
     return input_file.with_suffix(PREPARED_AUDIO_SUFFIX)
+
+
+def find_leftover_prepared_audio(folder: PathLike,
+                                 extensions: Iterable[str] | None = None) -> list[Path]:
+    """
+    Intermediate 16 kHz WAVs in a folder that still have their source file beside them.
+
+    A prepared WAV whose source is gone is never reported: it may be the only copy of
+    that recording, e.g. one the pipeline was pointed at directly.
+
+    Args:
+        folder (PathLike): Directory to scan. Not recursive.
+        extensions (Iterable[str] | None): Source media extensions to look for.
+            Defaults to MEDIA_EXTENSIONS.
+
+    Returns:
+        list[Path]: Intermediates that are safe to delete, sorted by name.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return []
+
+    extensions = MEDIA_EXTENSIONS if extensions is None else extensions
+    extensions = [ext.lower() for ext in extensions]
+    names = sorted(f.name for f in folder.iterdir() if f.is_file())
+    # Compared case-insensitively so "clip.MP4" still accounts for "clip.16k.wav"
+    lowered = {name.lower() for name in names}
+
+    leftovers = []
+    for name in names:
+        if not name.endswith(PREPARED_AUDIO_SUFFIX):
+            continue
+        stem = name[:-len(PREPARED_AUDIO_SUFFIX)]
+        if any(f"{stem}{ext}".lower() in lowered for ext in extensions):
+            leftovers.append(folder / name)
+    return leftovers
+
+
+def remove_leftover_prepared_audio(folder: PathLike,
+                                   extensions: Iterable[str] | None = None) -> list[Path]:
+    """
+    Delete the intermediate 16 kHz WAVs that find_leftover_prepared_audio reports.
+
+    Returns:
+        list[Path]: The files actually removed. A file that could not be deleted (open
+        elsewhere, read-only) is reported and skipped rather than raising, so one
+        stubborn file cannot abort a sweep over a whole tree.
+    """
+    removed = []
+    for path in find_leftover_prepared_audio(folder, extensions):
+        try:
+            path.unlink()
+        except OSError as e:
+            print(f"Could not remove {path}: {e}")
+            continue
+        removed.append(path)
+    return removed
 
 
 def prepare_audio(input_file: PathLike,

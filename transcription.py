@@ -1,7 +1,9 @@
-import os
-## Disable logging stuff - must be set before nemo is imported to have any effect
-os.environ["NEMO_LOG_LEVEL"] = "40"
+## Must come before the torch and nemo imports below: it silences warnings those
+## packages emit while importing, which nothing here can act on.
+from quiet_logs import silence_dependency_warnings
+silence_dependency_warnings()
 
+import os
 import json
 import shutil
 import sys
@@ -14,13 +16,11 @@ from faster_whisper import WhisperModel
 from faster_whisper.transcribe import Segment
 from pathlib import Path
 from nemo.collections.asr.models import SortformerEncLabelModel, EncDecSpeakerLabelModel
-from nemo.utils import logging as nemo_logging
-from audio_utils import prepare_audio, prepared_audio_path, PREPARED_AUDIO_SUFFIX
+from audio_utils import (prepare_audio, prepared_audio_path, PREPARED_AUDIO_SUFFIX,
+                         MEDIA_EXTENSIONS)
 from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import AgglomerativeClustering
 from post_processing import export_transcript_by_speaker, concatenate_batch_transcripts
-
-nemo_logging.set_verbosity(nemo_logging.ERROR)
 
 # Cosine distance below which two speaker embeddings are taken to be the same person.
 # It applies to raw (uncentered) L2-normalized TitaNet embeddings, where same-speaker
@@ -1399,7 +1399,7 @@ def transcribe_and_diarize_folder(
     os.makedirs(output_dir, exist_ok=True)
 
     if video_extensions is None:
-        video_extensions = [".mp4", ".m4v", ".avi", ".mov", ".mkv", ".wav", ".mp3", ".flac", ".m4a", ".aac"]
+        video_extensions = MEDIA_EXTENSIONS
     video_extensions = [ext.lower() for ext in video_extensions]
 
     # Discover candidate files
@@ -1429,7 +1429,8 @@ def transcribe_and_diarize_folder(
     # Initialize models once
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "auto" if device == "cuda" else "int8"
-    print(f"Loading models on {device} ({compute_type})...")
+    if verbose:
+        print(f"Loading models on {device} ({compute_type})...")
 
     whisper_model = WhisperModel(whisper_size, device=device, compute_type=compute_type)
     diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1").to(device).eval() # type: ignore

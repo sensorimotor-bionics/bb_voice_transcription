@@ -4,6 +4,7 @@ from pathlib import Path
 from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                            MIN_SPEAKER_SPEECH_SECONDS, SPEAKER_COUNT_POLICIES)
 from speaker_roles import add_role_arguments, roles_requested, label_from_args
+from audio_utils import remove_leftover_prepared_audio
 
 def main():
     parser = argparse.ArgumentParser(
@@ -60,6 +61,17 @@ def main():
             print(f"Speaker role labelling failed ({exc})")
             print("The transcripts themselves were written; rerun the labelling on its own with "
                   "label_speakers.py once the problem is fixed.")
+
+    # transcribe_and_diarize_folder deletes each intermediate as soon as it is done with
+    # it, but a run that was killed mid-file, or an earlier --no_cleanup run over the same
+    # folder, leaves them sitting next to the media. Sweep whatever survived.
+    if not args.no_cleanup:
+        removed = remove_leftover_prepared_audio(folder_path)
+        if removed:
+            print(f"Cleanup: removed {len(removed)} leftover intermediate file(s).")
+            if args.verbose:
+                for path in removed:
+                    print(f"  {path.name}")
 
     print("Batch processing completed successfully.")
 

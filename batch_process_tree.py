@@ -5,9 +5,8 @@ from pathlib import Path
 from transcription import (transcribe_and_diarize_folder, DEFAULT_SPEAKER_DISTANCE_THRESHOLD,
                            MIN_SPEAKER_SPEECH_SECONDS, SPEAKER_COUNT_POLICIES)
 from speaker_roles import add_role_arguments, roles_requested, label_from_args
-
-# Mirrors the default extension list in transcribe_and_diarize_folder
-MEDIA_EXTENSIONS = [".mp4", ".m4v", ".avi", ".mov", ".mkv", ".wav", ".mp3", ".flac", ".m4a", ".aac"]
+from audio_utils import (find_leftover_prepared_audio, remove_leftover_prepared_audio,
+                         MEDIA_EXTENSIONS)
 
 TRANSCRIPTS_DIRNAME = "transcripts"
 
@@ -54,6 +53,36 @@ def clear_previous_output(folder: Path) -> list[Path]:
     return removed
 
 
+def sweep_intermediates(folders: list[Path], dry_run: bool = False, verbose: bool = False) -> int:
+    """
+    Remove intermediate 16 kHz WAVs left behind in the given folders.
+
+    transcribe_and_diarize_folder deletes its own intermediates as it goes, but plenty of
+    them survive that: a run killed mid-file, a run made with --no_cleanup, or a
+    subfolder that is skipped as already processed and so never revisited. Those strays
+    would otherwise sit next to the media forever, so the whole tree is swept once at the
+    end regardless of whether this run touched each subfolder.
+
+    Returns:
+        int: How many files were removed, or would be removed when dry_run is set.
+    """
+    total = 0
+    for folder in folders:
+        if dry_run:
+            affected = find_leftover_prepared_audio(folder, MEDIA_EXTENSIONS)
+        else:
+            affected = remove_leftover_prepared_audio(folder, MEDIA_EXTENSIONS)
+        if not affected:
+            continue
+        total += len(affected)
+        print(f"  {'Would remove' if dry_run else 'Removed'} {len(affected)} "
+              f"intermediate file(s) in {folder.name}")
+        if verbose:
+            for path in affected:
+                print(f"    {path.name}")
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Walk the immediate subfolders of a top-level folder and run transcription "
@@ -80,7 +109,11 @@ def main():
                              "support: ask, keep the given number, or take the predicted one. "
                              "Defaults to 'given' here, since a tree walk is usually unattended")
     parser.add_argument("--no_cleanup", action="store_true",
-                        help="Keep the intermediate 16 kHz WAV files instead of deleting them")
+                        help="Keep the intermediate 16 kHz WAV files instead of deleting them, "
+                             "and skip the final sweep for leftovers from earlier runs")
+    parser.add_argument("--cleanup_only", action="store_true",
+                        help="Only delete leftover intermediate 16 kHz WAV files from the tree, "
+                             "then exit without transcribing anything")
     parser.add_argument("--force", action="store_true",
                         help="Reprocess subfolders even if they already have a transcripts folder, "
                              "clearing their previous transcript output first")
@@ -90,6 +123,10 @@ def main():
     add_role_arguments(parser)
 
     args = parser.parse_args()
+
+    if args.cleanup_only and args.no_cleanup:
+        print("Error: --cleanup_only and --no_cleanup ask for opposite things.")
+        sys.exit(1)
 
     root = Path(args.root)
     if not root.is_dir():
@@ -102,6 +139,22 @@ def main():
         d for d in root.iterdir()
         if d.is_dir() and d.name != TRANSCRIPTS_DIRNAME
     ])
+
+    # The root itself is swept too, so intermediates from a flat batch_process.py run
+    # over the same tree are not left behind either.
+    sweep_targets = [root] + subfolders
+
+    if args.cleanup_only:
+        print(f"Sweeping {len(sweep_targets)} folder(s) under {root.resolve()} for "
+              "leftover intermediate files...")
+        total = sweep_intermediates(sweep_targets, dry_run=args.dry_run, verbose=True)
+        if not total:
+            print("  No leftover intermediate files found.")
+        elif args.dry_run:
+            print(f"\nDry run: {total} intermediate file(s) would be removed. Nothing was deleted.")
+        else:
+            print(f"\nRemoved {total} intermediate file(s).")
+        return
 
     if not subfolders:
         print(f"No subfolders found in {root.resolve()}")
@@ -128,6 +181,9 @@ def main():
         print(f"\nDry run: {len(pending)} to process, {len(skipped)} skipped. Nothing was written.")
         if roles_requested(args):
             print(f"Speaker roles would be labelled per subfolder with {args.role_model}.")
+        if not args.no_cleanup:
+            if not sweep_intermediates(sweep_targets, dry_run=True, verbose=args.verbose):
+                print("No leftover intermediate files to clean up.")
         return
 
     if not pending:
@@ -140,7 +196,7 @@ def main():
         try:
             if args.force:
                 removed = clear_previous_output(folder)
-                if removed:
+                if removed and args.verbose:
                     print(f"  Cleared {len(removed)} stale output file(s) from "
                           f"{folder.name}/{TRANSCRIPTS_DIRNAME}")
             summary = transcribe_and_diarize_folder(
@@ -164,6 +220,12 @@ def main():
                 traceback.print_exc()
             failed.append((folder, exc))
             continue
+        finally:
+            # Sweep as we go rather than only at the end, so a batch that is interrupted
+            # or crashes halfway does not leave the subfolders it already finished
+            # littered with intermediates.
+            if not args.no_cleanup:
+                sweep_intermediates([folder], verbose=args.verbose)
 
         # Each subfolder is one session, so roles are decided per subfolder. This runs
         # after the transcripts are safely on disk and cannot undo them: a stopped Ollama
@@ -187,6 +249,14 @@ def main():
         print(f"\n{len(unlabelled)} subfolder(s) were transcribed but not role-labelled:")
         for folder, exc in unlabelled:
             print(f"  UNLABELLED {folder.name}: {exc}")
+
+    # Final pass over the whole tree, including the subfolders this run skipped: those are
+    # never revisited, so leftovers from an earlier interrupted run would live there
+    # forever otherwise.
+    if not args.no_cleanup:
+        total = sweep_intermediates(sweep_targets, verbose=args.verbose)
+        if total:
+            print(f"\nCleanup: removed {total} leftover intermediate file(s).")
 
     if failed:
         sys.exit(1)
